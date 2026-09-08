@@ -1,0 +1,13 @@
+---
+description: StarDust UI — never move or amend Windows AppData or UI config stored there
+alwaysApply: true
+---
+
+# StarDust UI: never move or amend AppData
+
+Do not move, rename, copy-away, relocate, or amend Windows `AppData` (Roaming, Local, or LocalLow), including `%APPDATA%\StarDust`.
+
+- Keep UI state at `%APPDATA%\StarDust` (layout, mode, history, WebView2 profile). Do not put it in the git repo or change `config_dir()` / `layout_file()` off APPDATA.
+- Do not create, edit, patch, delete, or overwrite files under `AppData` (no JSON/layout/history/profile writes, no `Set-Content` / `Out-File` / redirect into that tree).
+- Do not use `/api/rename`, `/api/move`, cosmos drag-and-drop, or shell `Move-Item` / `mv` on `AppData`, `Application Data`, or `%APPDATA%\StarDust`.
+- Keep search skip: do not walk directories named `AppData` or `Application Data`.

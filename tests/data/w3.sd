@@ -1,0 +1,9 @@
+endian little
+
+import write_a(ptr, len) -> void {
+  symbol write_a;
+}
+
+import mut_b(ptr, len) -> void {
+  symbol mut_b;
+}

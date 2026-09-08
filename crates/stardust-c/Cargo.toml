@@ -1,0 +1,9 @@
+[package]
+name = "stardust-c"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-tree C shared library fixture for StarDust import tests"
+
+[build-dependencies]
+cc = "1"

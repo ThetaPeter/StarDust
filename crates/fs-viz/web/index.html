@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en" translate="no">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="google" content="notranslate"/>
+  <meta http-equiv="Content-Language" content="en"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>StarDust</title>
+  <link rel="icon" type="image/png" href="/web/luna-icon.png"/>
+  <script>
+  (function () {
+    var t = Date.now();
+    var href = "/web/app.css";
+    var q = href.indexOf("?") >= 0 ? "&t=" : "?t=";
+    document.write('<link rel="stylesheet" href="' + href + q + t + '"/>');
+  })();
+  </script>
+</head>
+<body>
+<canvas id="sky" aria-hidden="true"></canvas>
+<div id="app">
+  <header id="topbar">
+    <nav id="menu" class="menubar">
+      <div class="menu">
+        <button type="button" class="menu-btn" data-menu="file">File</button>
+        <div class="menu-pop" id="menu-file" hidden>
+          <button type="button" data-cmd="open-folder">Open folder…<span class="accel">Ctrl+O</span></button>
+          <button type="button" data-cmd="open-desktop">Desktop<span class="accel">Ctrl+D</span></button>
+          <button type="button" data-cmd="open-this-pc">This PC<span class="accel">Ctrl+Shift+P</span></button>
+        </div>
+      </div>
+      <div class="menu">
+        <button type="button" class="menu-btn" data-menu="edit">Edit</button>
+        <div class="menu-pop" id="menu-edit" hidden>
+          <button type="button" data-cmd="cut" data-need-sel>Cut<span class="accel">Ctrl+X</span></button>
+          <button type="button" data-cmd="copy" data-need-sel>Copy<span class="accel">Ctrl+C</span></button>
+          <button type="button" data-cmd="paste">Paste<span class="accel">Ctrl+V</span></button>
+          <button type="button" data-cmd="rename" data-need-sel>Rename<span class="accel">F2</span></button>
+          <button type="button" data-cmd="select-all">Select all<span class="accel">Ctrl+A</span></button>
+          <button type="button" data-cmd="new-folder">New folder<span class="accel">Ctrl+Shift+N</span></button>
+          <hr/>
+          <button type="button" data-cmd="send-agent" data-need-sel>Send to Agent<span class="accel">Ctrl+Shift+A</span></button>
+        </div>
+      </div>
+      <div class="menu">
+        <button type="button" class="menu-btn" data-menu="view">View</button>
+        <div class="menu-pop" id="menu-view" hidden>
+          <button type="button" id="btn-mode" data-cmd="toggle-mode" title="2D / 3D for the focused view (Ctrl+Shift+2 / Ctrl+Shift+3)">2D<span class="accel">Ctrl+Shift+2 / 3</span></button>
+          <button type="button" data-cmd="new-split">New split<span class="accel">Ctrl+N</span></button>
+          <button type="button" data-cmd="refresh">Refresh<span class="accel">F5</span></button>
+          <hr/>
+          <button type="button" data-cmd="tile" title="Arrange file windows in a grid">Tile windows</button>
+          <button type="button" data-cmd="cascade" title="Stack file windows with an offset">Cascade windows</button>
+          <hr/>
+          <div class="submenu">
+            <button type="button" class="submenu-btn">Sort</button>
+            <div class="menu-pop nested">
+              <button type="button" data-cmd="sort-name">Name</button>
+              <button type="button" data-cmd="sort-type">Type</button>
+              <button type="button" data-cmd="sort-size">Size</button>
+            </div>
+          </div>
+          <button type="button" data-cmd="galaxy">Galaxy</button>
+          <hr/>
+          <button type="button" id="btn-ui-mode" data-cmd="toggle-ui-mode" title="Switch StarDust UI / Windows UI">StarDust UI</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button type="button" class="menu-btn" data-menu="tools">Tools</button>
+        <div class="menu-pop" id="menu-tools" hidden>
+          <button type="button" data-cmd="cargo-test">cargo test</button>
+          <button type="button" data-cmd="open-cursor">Open in Cursor</button>
+          <button type="button" data-cmd="refresh-web">Refresh web<span class="accel">Ctrl+F5</span></button>
+          <hr/>
+          <button type="button" data-cmd="rebuild-ui">Rebuild StarDust UI</button>
+        </div>
+      </div>
+      <div class="menu">
+        <button type="button" class="menu-btn" data-menu="help">Help</button>
+        <div class="menu-pop" id="menu-help" hidden>
+          <button type="button" data-cmd="keyboard-shortcuts">Keyboard shortcuts<span class="accel">Ctrl+/</span></button>
+          <button type="button" data-cmd="about">About</button>
+        </div>
+      </div>
+    </nav>
+    <div id="search">
+      <input id="search-input" type="search" placeholder="Search files and folders" autocomplete="off" spellcheck="false"/>
+      <div id="search-drop" class="menu-pop search-drop" hidden></div>
+    </div>
+  </header>
+  <div id="banner" hidden></div>
+  <div id="workspace">
+    <div id="main">
+      <div id="splits"></div>
+      <div id="floats"></div>
+    </div>
+    <div id="agent-sash" title="Resize agent"></div>
+    <aside id="agent">
+      <header class="agent-head">
+        <button type="button" id="agent-toggle" class="icon-btn" title="Collapse agent">▸</button>
+        <div id="agent-tabs" role="tablist" aria-label="Agent threads"></div>
+        <button type="button" id="agent-new" class="icon-btn" title="New thread">+</button>
+        <div class="agent-head-right">
+          <div class="agent-pop-wrap">
+            <button type="button" id="agent-history" class="icon-btn" title="History" aria-label="History">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M8 5v3.2L10.2 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <div id="agent-history-pop" class="menu-pop agent-pop" hidden>
+              <ul id="thread-list"></ul>
+            </div>
+          </div>
+          <div class="agent-pop-wrap">
+            <button type="button" id="agent-rules-btn" class="icon-btn" title="Rules" aria-label="Rules">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path d="M5 2.5h4.2L12.5 6v7.5H5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+                <path d="M9.2 2.5V6H12.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+                <path d="M6.5 8.2h3.2M6.5 10.6h3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <div id="agent-rules-pop" class="menu-pop agent-pop" hidden>
+              <textarea id="agent-rules" rows="6" placeholder="Applied on every send. Leave empty for none."></textarea>
+            </div>
+          </div>
+        </div>
+      </header>
+      <div class="agent-body">
+        <div class="agent-chat">
+          <div id="agent-key-warn" class="agent-warn" hidden>
+            Set <code>CURSOR_API_KEY</code> in the environment or a gitignored local env file
+            (<code>crates/fs-viz/.env</code>). The cosmos UI still works without the agent sidecar.
+          </div>
+          <div id="agent-thread-title" class="agent-thread-title" hidden tabindex="-1"></div>
+          <div id="agent-msgs" class="agent-msgs"></div>
+          <div id="agent-chips" class="agent-chips"></div>
+          <div class="agent-compose">
+            <textarea id="agent-input" rows="3" placeholder="Plan / Agent. @ chips send even with an empty message."></textarea>
+            <div class="agent-bar">
+              <select id="agent-mode" title="Mode">
+                <option value="agent">Agent</option>
+                <option value="plan">Plan</option>
+                <option value="ask">Ask</option>
+              </select>
+              <select id="agent-model" title="Model">
+                <option value="composer-2.5">composer-2.5</option>
+                <option value="grok-4.6">grok-4.6</option>
+                <option value="gpt-5.1">gpt-5.1</option>
+              </select>
+              <button type="button" id="agent-send">Send</button>
+              <button type="button" id="agent-stop" hidden>Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+  <button type="button" id="agent-strip" hidden title="Open agent" aria-label="Open agent"><span class="agent-tab-tri"></span></button>
+  <div id="status-strip" title="Failsafe: Ctrl+Shift+F12 restores Windows Explorer">
+    <span id="status-health" class="health-dot" title="UI health"></span>
+    <span id="status-text">Ready</span>
+  </div>
+  <footer id="pin"></footer>
+</div>
+
+<div id="ctx" class="menu-pop ctx" hidden></div>
+<div id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div id="modal-actions"></div>
+  </div>
+</div>
+<div id="shortcut-overlay" hidden>
+  <div class="shortcut-card" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
+    <h2 id="shortcut-title">Keyboard shortcuts</h2>
+    <p class="shortcut-hint">Esc closes · Ctrl+/ or F1 toggles · Help → Keyboard shortcuts</p>
+    <div class="shortcut-groups">
+      <section>
+        <h3>Navigation</h3>
+        <dl>
+          <dt>Enter</dt><dd>Open / enter</dd>
+          <dt>Backspace</dt><dd>Parent folder</dd>
+          <dt>Alt+Up</dt><dd>Parent folder</dd>
+          <dt>Alt+Left</dt><dd>Back</dd>
+          <dt>Alt+Right</dt><dd>Forward</dd>
+          <dt>Ctrl+L</dt><dd>Focus path field</dd>
+          <dt>Ctrl+F</dt><dd>Focus search</dd>
+          <dt>F5</dt><dd>Reload focused view</dd>
+          <dt>Ctrl+F5</dt><dd>Refresh web (JS/CSS from disk, no Cargo)</dd>
+          <dt>Ctrl+N</dt><dd>New split</dd>
+          <dt>Ctrl+W</dt><dd>Close cosmos pane</dd>
+          <dt>Ctrl+Shift+2</dt><dd>2D</dd>
+          <dt>Ctrl+Shift+3</dt><dd>3D</dd>
+          <dt>Esc</dt><dd>Close menus, search, overlay</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Files</h3>
+        <dl>
+          <dt>Ctrl+A</dt><dd>Select all stars</dd>
+          <dt>Ctrl+C</dt><dd>Copy</dd>
+          <dt>Ctrl+X</dt><dd>Cut</dd>
+          <dt>Ctrl+V</dt><dd>Paste</dd>
+          <dt>Ctrl+S</dt><dd>Save focused editor</dd>
+          <dt>F2</dt><dd>Rename</dd>
+          <dt>Delete</dt><dd>Recycle Bin / Trash</dd>
+          <dt>Ctrl+O</dt><dd>Open folder…</dd>
+          <dt>Ctrl+D</dt><dd>Desktop</dd>
+          <dt>Ctrl+Shift+P</dt><dd>This PC</dd>
+          <dt>Ctrl+Shift+N</dt><dd>New folder</dd>
+          <dt>Alt+Enter</dt><dd>Properties</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Agent</h3>
+        <dl>
+          <dt>Ctrl+I</dt><dd>Toggle Agent (works while typing)</dd>
+          <dt>Ctrl+Shift+I</dt><dd>Focus composer (works while typing)</dd>
+          <dt>Ctrl+Shift+A</dt><dd>Send selection to Agent</dd>
+          <dt>Ctrl+Shift+T</dt><dd>New thread</dd>
+          <dt>Ctrl+Shift+.</dt><dd>Stop</dd>
+          <dt>Enter</dt><dd>Send (composer)</dd>
+          <dt>Shift+Enter</dt><dd>Newline (composer)</dd>
+          <dt>F2</dt><dd>Rename the focused thread tab or History row</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Shell</h3>
+        <dl>
+          <dt>Ctrl+/</dt><dd>Keyboard shortcuts overlay</dd>
+          <dt>F1</dt><dd>Keyboard shortcuts overlay</dd>
+          <dt>Ctrl+Shift+F12</dt><dd>Failsafe: restore Windows UI</dd>
+        </dl>
+      </section>
+    </div>
+  </div>
+</div>
+<input id="rename-overlay" class="rename-overlay" hidden/>
+
+<script>
+(function () {
+  var t = Date.now();
+  function js(src) {
+    var q = src.indexOf("?") >= 0 ? "&t=" : "?t=";
+    document.write('<script src="' + src + q + t + '"><\/script>');
+  }
+  js("/web/cosmos-look.js");
+  js("/web/sky.js");
+  js("/web/app.js");
+  js("/web/cosmos2d.js");
+  js("/web/cosmos3d.js");
+  js("/web/editor.js");
+  js("/web/agent.js");
+})();
+</script>
+<script>
+SD.boot().catch((e) => {
+  const b = document.getElementById("banner");
+  if (b) {
+    b.hidden = false;
+    b.textContent = "UI failed to start: " + (e && e.message ? e.message : e);
+  }
+  console.error(e);
+});
+</script>
+</body>
+</html>

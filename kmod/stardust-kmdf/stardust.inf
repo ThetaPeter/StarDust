@@ -1,0 +1,63 @@
+;
+; StarDust KMDF named region backing (root-enumerated control device).
+; World RW after install (0666 analog); install/start still needs Administrator.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+PnpLockdown = 1
+CatalogFile = stardust.cat
+DriverVer   = 09/02/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+stardust.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%Stardust.DeviceDesc% = Stardust_Install, Root\Stardust
+
+[Stardust_Install.NT]
+CopyFiles = Stardust_CopyFiles
+
+[Stardust_CopyFiles]
+stardust.sys
+
+[Stardust_Install.NT.HW]
+AddReg = Stardust_Security_AddReg
+
+[Stardust_Security_AddReg]
+; World RW (0666 analog); SYSTEM and Administrators keep full control
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)(A;;GRGW;;;RC)"
+
+[Stardust_Install.NT.Services]
+AddService = stardust,0x00000002,Stardust_Service_Inst
+
+[Stardust_Service_Inst]
+DisplayName    = %Stardust.ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\stardust.sys
+
+[Stardust_Install.NT.Wdf]
+KmdfService = stardust, Stardust_KmdfInst
+
+[Stardust_KmdfInst]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+ManufacturerName     = "StarDust"
+DiskName             = "StarDust KMDF Installation Disk"
+Stardust.DeviceDesc  = "StarDust named region backing"
+Stardust.ServiceDesc = "StarDust KMDF"

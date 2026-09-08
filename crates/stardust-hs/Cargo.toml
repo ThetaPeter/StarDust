@@ -1,0 +1,6 @@
+[package]
+name = "stardust-hs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-tree Haskell shared library fixture for StarDust import tests"

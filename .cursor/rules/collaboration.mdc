@@ -1,0 +1,57 @@
+---
+description: Surface unknowns before implementation and package work for review after it
+alwaysApply: true
+---
+
+# Collaboration
+
+## Before — finding unknowns
+
+On unfamiliar areas, run a blind spot pass first: unknowns / assumptions / better prompts — **3–7 bullets max**.
+
+Then interview — **bias toward asking too often rather than too little**:
+
+- Ask **one question at a time** (use the AskQuestion tool when available; otherwise ask in chat with numbered options).
+- Prioritize questions whose answers would change architecture (data models, contracts, scope, identity, syntax).
+- Also ask about **medium** decisions before locking a default (API shape, error behavior, which form the bench uses, timeout values, doc wording that encodes semantics).
+- **Do not** silently pick a “sensible default” when Developer could reasonably disagree — ask first, then lock.
+- If Developer has not answered, keep the choice unconfirmed in the plan / chat and **do not implement** that choice yet. After the plan is executed, record it in `assumption.md` (**Unconfirmed**) or unanswered `choices.md`.
+- **Do not** stop interviewing early: continue while any open choice would change code, tests, or the live book. Only stop when remaining unknowns are purely mechanical (file renames, formatting).
+- Interview **continuously**, not only at kickoff: pause and ask whenever requirements drift, a new unknown appears, an assumption is about to drive a decision, or you are about to write a plan/lock that Developer has not confirmed.
+- In Plan mode especially: if the last several turns had no clarifying question, you are under-asking — ask before the next CreatePlan/plan edit when anything is still ambiguous.
+- Prefer a short clarifying question over a long speculative implementation.
+
+### Ask first; record gaps
+
+Asking has **higher priority than debugging** when you cannot tell whether a failure comes from **Developer instruction** (underspecified, special case, wrong expected string) or from **your implementation**:
+
+1. If that distinction is unclear → **ask first** (one question). Do **not** open another debug/fix loop.
+2. Asking outranks probing, patching expectations, and speculative refactors.
+3. Only debug freely when the failure is clearly mechanical (typo, missing import, obvious compile error) **or** Developer has already locked the intended behavior.
+4. Temporary hypotheses go in chat as **unconfirmed** — never treat an unconfirmed product guess as a “bug fixed.” Write them to `assumption.md` (**Unconfirmed**) only after the plan is executed.
+
+If you want a `.sd` construct or a host API and StarDust does **not** support it (or silently does the wrong thing):
+
+1. **Stop and ask** Developer whether to fill it (this turn, one question). Do not silently grow a language and do not only paper over it with a local workaround.
+2. If Developer says fill: implement the IR/host fix **before** (or instead of) an app workaround.
+3. If Developer says not now: keep the workaround, record the gap in the plan / (after execution) `problems.md`.
+4. Include: what you tried, observed behavior, workaround (if any), whether you want a language/host fix.
+
+During planning, keep unconfirmed choices in the plan (do not write living docs yet). After the plan is executed, record them in `assumption.md` or unanswered `choices.md`. Do not invent a per-row status tag.
+
+## Plans
+
+- **You may switch to Plan mode yourself at any time** (`SwitchMode` → `plan`). Do not wait for Developer to flip the mode. Use it when architecture/scope is unclear, before a large implementation, or when a clarifying interview should happen before code. Switching does not skip the interview.
+- Lead with the decisions most likely to change: data models, types, UX.
+- Bury mechanical work (refactors, renames, plumbing) at the bottom — mention it briefly, don't elaborate.
+- Unconfirmed choices must not appear as fake locks; either ask or label them unconfirmed in the plan (then `assumption.md` / `choices.md` after execution).
+- **When to edit docs** follows `.cursor/rules/handoff.mdc`: filling Review gates and remaining-wave I/O/B is allowed **before** code; marking a wave `done` and moving I/O/B to `waves-done.md` is **after**. Do not update docs as a substitute for executing a named wave.
+- When Developer asks for an explanation of a concept or background, answer in **chat** — not in the AskQuestion widget and not as a quiz UI.
+
+## After — review packaging
+
+- **Pitch / explainer**: when asked, package the work for review and buy-in — the prototype, the relevant `waves.md` sections, and notes explaining what was built, why, and the trade-offs made.
+- **Quiz**: offer regularly after large changes, at milestones, and whenever the work took a direction Developer has not yet reviewed. Cover decisions that changed behavior (Confirmed/Unconfirmed, new `problems.md` items) — not trivia (file renames, formatting).
+  - Offer in chat at those moments; **write** `review.md` (repo root) only when Developer asks for a durable review artifact.
+  - Format: Markdown at **`review.md`** (fixed path at repo root; overwrite when regenerating). Include a short report plus 3–5 questions. Put answers in the **same file** under collapsed `<details>` blocks. Do **not** use HTML review/quiz artifacts or a separate answers file.
+  - After Developer accepts a review: merge unique facts into `waves.md` Locks, `assumption.md`, `problems.md`, or `handoff.md` as appropriate (still only as a post-plan closeout), then delete or clear `review.md` so living docs remain the source of truth. Do not merge into `specification.md` or `docs/*`.

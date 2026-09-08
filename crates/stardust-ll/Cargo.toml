@@ -1,0 +1,6 @@
+[package]
+name = "stardust-ll"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-tree LLVM IR shared library fixture for StarDust import tests"

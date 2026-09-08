@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Python headers, clang, ghc, and kernel headers
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-dev clang ghc build-essential linux-headers-$(uname -r)
+      - name: Test
+        run: cargo test
+      - name: Test with Python
+        run: cargo test --features python
+      - name: Test with LLVM
+        run: cargo test --features llvm
+      - name: Test with Haskell
+        run: cargo test --features haskell
+      - name: Install Lean 4
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+      - name: Test with Lean
+        run: cargo test --features lean
+      - name: Build kernel module
+        run: make -C kmod/stardust
+      - name: Load kernel module
+        run: sudo insmod kmod/stardust/stardust.ko
+      - name: Check /dev/stardust
+        run: test -c /dev/stardust && ls -l /dev/stardust
+      - name: Test with kernel
+        run: cargo test --features kernel
+      - name: Unload kernel module
+        if: always()
+        run: sudo rmmod stardust || true

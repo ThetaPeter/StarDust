@@ -1,0 +1,180 @@
+endian little
+bit_order lsb0
+
+layout CnsComponentLay repr_c {
+  char: slice u8;
+  cns: slice u8;
+  unicode: slice u8;
+  encoding: slice u8;
+}
+
+layout CnsWordLay repr_c {
+  char: slice u8;
+  cns: slice u8;
+  strokes: slice u8;
+  ids: slice u8;
+  seq_level: u8;
+  has_seq_level: u8;
+  split_index: u8;
+}
+
+layout IdsEntityLay repr_c {
+  entity: slice u8;
+  component: slice u8;
+}
+
+layout LunaOverrideLay repr_c {
+  char: slice u8;
+  encoding: slice u8;
+  post: slice u8;
+}
+
+layout LunaWordLay repr_c {
+  char: slice u8;
+  cns: slice u8;
+  strokes: slice u8;
+  ids: slice u8;
+  seq_level: u8;
+  has_seq_level: u8;
+  split_index: u8;
+  encoding: slice u8;
+  post_encoding: slice u8;
+}
+
+layout StrokeTypeLay repr_c {
+  code: u64;
+  name: slice u8;
+  glyph: slice u8;
+}
+
+layout WordCompLay repr_c {
+  from: slice u8;
+  to: slice u8;
+  seq: u8;
+}
+
+layout WordIdsLay repr_c {
+  from: slice u8;
+  seq: u8;
+  leaf_index: u8;
+}
+
+layout WordStrokeLay repr_c {
+  from: slice u8;
+  to: slice u8;
+  seq: u8;
+}
+
+layout WorldLay repr_c {
+  n_words: u64;
+  n_comps: u64;
+  n_stroke_types: u64;
+  n_word_ids: u64;
+  n_word_comp: u64;
+  n_word_stroke: u64;
+  n_ids_entity: u64;
+  n_override: u64;
+  blob_used: u64;
+  query: slice u8;
+  result: slice u8;
+  smoke_chk: u64;
+  mismatch_count: u64;
+  luna_smoke_chk: u64;
+  words: [struct repr_c {
+    char: slice u8;
+    cns: slice u8;
+    strokes: slice u8;
+    ids: slice u8;
+    seq_level: u8;
+    has_seq_level: u8;
+    split_index: u8;
+    encoding: slice u8;
+    post_encoding: slice u8;
+  }; 8192];
+  components: [struct repr_c {
+    char: slice u8;
+    cns: slice u8;
+    unicode: slice u8;
+    encoding: slice u8;
+  }; 1024];
+  stroke_types: [struct repr_c {
+    code: u64;
+    name: slice u8;
+    glyph: slice u8;
+  }; 8];
+  word_ids: [struct repr_c {
+    from: slice u8;
+    seq: u8;
+    leaf_index: u8;
+  }; 256];
+  word_comp: [struct repr_c {
+    from: slice u8;
+    to: slice u8;
+    seq: u8;
+  }; 32768];
+  word_stroke: [struct repr_c {
+    from: slice u8;
+    to: slice u8;
+    seq: u8;
+  }; 32768];
+  ids_entity: [struct repr_c {
+    entity: slice u8;
+    component: slice u8;
+  }; 16];
+  overrides: [struct repr_c {
+    char: slice u8;
+    encoding: slice u8;
+    post: slice u8;
+  }; 256];
+  blob: [u8; 4194304];
+}
+
+class CnsGraph {
+  layout WorldLay;
+  method components_of(ptr, len) -> void {
+    symbol components_of;
+    lang python;
+  }
+  method import_all(ptr, len) -> void {
+    symbol import_all;
+    lang python;
+  }
+  method smoke(ptr, len) -> void {
+    symbol smoke;
+    lang python;
+  }
+  method stroke_order(ptr, len) -> void {
+    symbol stroke_order;
+    lang python;
+  }
+}
+
+class CnsWord {
+  layout CnsWordLay;
+}
+
+class LunaStore {
+  layout WorldLay;
+  base CnsGraph;
+  method check_dict(ptr, len) -> void {
+    symbol check_dict;
+    lang python;
+  }
+  method check_store(ptr, len) -> void {
+    symbol check_store;
+    lang python;
+  }
+  method persist_encodings(ptr, len) -> void {
+    symbol persist_encodings;
+    lang python;
+  }
+  method smoke_luna(ptr, len) -> void {
+    symbol smoke_luna;
+    lang python;
+  }
+}
+
+class LunaWord {
+  layout LunaWordLay;
+  base CnsWord;
+}

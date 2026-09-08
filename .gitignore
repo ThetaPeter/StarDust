@@ -1,0 +1,12 @@
+/target
+.env
+crates/fs-viz/agent/node_modules
+kmod/stardust/*.o
+kmod/stardust/*.ko
+kmod/stardust/*.mod
+kmod/stardust/*.mod.c
+kmod/stardust/*.mod.o
+kmod/stardust/*.symvers
+kmod/stardust/*.order
+kmod/stardust/.*.cmd
+kmod/stardust/.tmp_versions/

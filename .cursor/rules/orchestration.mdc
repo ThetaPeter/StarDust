@@ -1,0 +1,84 @@
+---
+description: Orchestrator/subagent division of labor, I/O/B task contracts, and escalation rules
+alwaysApply: true
+---
+
+# Orchestration
+
+Core principle: minimize orchestrator context. Delegate anything a subagent can do, especially jobs that require reading large amounts of code or text. Subagents do not make big decisions; they escalate early when uncertain rather than guessing.
+
+## Workflow loop
+
+1. Write the I/O/B contract for the overall goal.
+2. Dispatch subagents with the full I/O/B contract in the prompt. **Always Grok-4.6-high (non-fast).** Task `model`: `cursor-grok-4.6-high` if listed; else `cursor-grok-4.6-xhigh` (same family, not Fast). **Never** `composer-2.5-fast`, any `*-fast` slug, Composer Fast, Composer, GPT, or Grok-4.5 for routine subagent work. Do not omit `model` if inherit would not be Grok-4.6-high.
+3. Verify subagent output against the benchmark.
+4. Apply escalation criteria below (bias: escalate when in doubt); otherwise iterate with a revised subagent task contract.
+
+## Subagent status checks
+
+While any subagent is running (especially background / long jobs), **check progress regularly** with cheap file signals. Default cadence is about **every 10 minutes**; choose a shorter or longer period when the I/O/B expected runtime clearly warrants it (e.g. a **1-minute** grep/search vs a 45-minute implement+test).
+
+**No sleep-timer terminals.** Do **not** launch `Start-Sleep`, `timeout`, or `ping`-wait reminder shells, and do not `AwaitShell` a long sleep to “check later.” On this Windows host those reminder terminals pile up, fill Cursor’s shell pool, and then **even `echo` / `cargo test` never return** — the timer looks permanently stuck. `Stop-Process` cancel is unreliable once the pool is wedged. **End the turn** so completion notifications (`turn_ended`) arrive; that is the wait. Mid-flight in the same turn: Glob/Read `LastWriteTime` on files the contract says will change. Do not start a new shell to sleep.
+
+**Cheap progress signals (no context bloat):** check `LastWriteTime` on the files the contract says will change, plus the process list (name / start time / CPU) only if a shell is already healthy. Do not read subagent transcripts or large outputs for routine checks — transcripts only record messages, not tool activity, and can look idle while the subagent works.
+
+On each check:
+
+1. **Is progress normal?** Compare activity (files touched, compile/test movement, coherent next step) to the I/O/B expected runtime. Quiet but expected long compiles/tests can be normal. A process burning steady CPU may be **working, not hung** — compare elapsed time against the documented runtime for that operation class before assuming a loop.
+2. **If progress looks too slow or stuck:** ask the subagent (via resume / progress message) whether they need escalation — do **not** interrupt or stop them abruptly. Abrupt stops risk half-applied edits and doc/code misalignment.
+
+**Runaway/thrash protocol:** if a *process* is clearly runaway (CPU far beyond the operation's known budget, no output progress), kill the **process**, not the agent — the subagent’s shell returns an error it can react to. Interrupt the agent itself only after repeated identical failing runs with no intervening edits (thrash); then demand a concise **state handoff** (what changed, what ran, what's half-done) before re-dispatching a narrower contract.
+
+Only interrupt/stop after the subagent confirms they need escalation, or after they are clearly unresponsive to a progress ask. Then diagnose and re-dispatch with a narrower contract per escalation criteria.
+
+Short tasks expected to finish well under the chosen poll period need no mid-flight check.
+
+**Do not wait after completion:** Once every dispatched subagent for the current batch has finished (completion notification / `turn_ended`), **stop waiting immediately** — verify outputs against the benchmark and continue the next step or end the turn. Do not keep polling, sleeping, or blocking on “all agents done” after they already finished. Prefer ending the turn so completions are delivered, over long `AwaitShell`/poll loops that only wait for subagents.
+
+## Roles
+
+**Orchestrator** (current model):
+- Defines task contracts, synthesizes subagent results, decides on escalation.
+- Keeps context lean: never reads large files, explores the codebase, or implements changes directly when a subagent can do it — **except** when escalation criteria apply.
+
+**Subagent** (Grok):
+- Handles all reading: exploration, search, file review.
+- Handles all coding: edits, refactors, fixes.
+- Returns concise summaries; never dumps raw file contents into the orchestrator thread.
+- Escalates back to the orchestrator instead of making big decisions.
+- **Always Grok-4.6-high (non-fast).** `model`: `cursor-grok-4.6-high` if listed; else `cursor-grok-4.6-xhigh`. **Never** Fast slugs (`composer-2.5-fast`, `*-fast`, Composer Fast), Composer, GPT, or Grok-4.5 for routine subagent work.
+- **Bias: escalate early.** Prefer escalate over guessing, thrashing, or silent scope stretch. When the next step needs a product/architecture choice, root cause is unclear, or the approach is thrashing — **stop and escalate** (do not invent a default and continue).
+- **One mechanical retry only.** On a clear, local failure (typo, missing import, obvious compile error) you may attempt **one** focused fix. If that retry still fails the benchmark, or the failure is not clearly mechanical — **escalate immediately**. Do not try alternate dependencies, long builds, speculative refactors, or a second speculative approach in-loop.
+
+## I/O/B contract reference
+
+Required for the overall goal, every orchestrator planning step, and every subagent dispatch:
+
+- **Input**: Files, paths, constraints, prior decisions, commands already run.
+- **Output**: Changed files, commands run, metrics, pass/fail, blockers.
+- **Benchmark**: The test or check that must pass.
+
+**Locked authority for this repo:** dumpable IR is the source of truth; `.sd` is a copy. Current-wave I/O/B lives in `waves.md`. Done-layer detail lives in `waves-done.md`. Kernel ioctl ABI lives in `kmod/stardust/stardust_uapi.h` and `kmod/stardust-kmdf/stardust_uapi.h`. Do not dispatch “fix the IR to match a syntax convenience.”
+
+## Escalation criteria
+
+**Default bias: escalate when in doubt.** Under-escalation (silent guessing, multi-approach thrash) is worse than an early escalate that returns a narrower contract.
+
+Escalate (orchestrator deep-dives on its current model) when:
+
+- **Ambiguity / choice**: multiple valid approaches, product or architecture trade-offs, unclear scope, or any decision the Developer might reasonably disagree with — escalate **before** coding a pick.
+- **Unsuccessful debugging** (mandatory, do not keep delegating the same failure):
+  - Subagent attempt failed the benchmark, or
+  - Root cause is unknown / not confidently isolated, or
+  - One focused mechanical retry was tried and still failed, or
+  - The subagent is thrashing (alternate approaches, dependency hell, repeated compile failures, long install-compile-debug loops, runtimes measured in many minutes without meeting the benchmark).
+  - On escalate: prefer asking the subagent first (see Subagent status checks); only interrupt/stop if they confirm need or are unresponsive. Then orchestrator takes over diagnosis (or re-scopes the I/O/B) and re-dispatches with a **narrower** contract after the failure mode is understood.
+- **Subagent self-report**: if a subagent says it needs escalation, treat that as authoritative — do not push them to “try one more thing” first.
+
+Do **not** escalate only for clearly mechanical work with a fixed I/O/B and no open choices (straightforward reads, single-file edits, searches) that the subagent can finish without ambiguity or a failed debug loop.
+
+## Verification gates (put these in every contract)
+
+- **Zero-regression gate:** compare **matched sets**, not just counts — a +N/−N swap can hide regressions behind a stable total. Name the exact baseline in the contract (e.g. L1 `round_trip_ir`, `store_retrieve`, `view_identity`, `alignment` from `waves.md` Named tests).
+- **No expectation edits:** smoke/test expected values may not be changed by a subagent. If the derivation is right and the *expectation* is stale, escalate — the Developer approves expectation updates.
+- **Locked-authority rule:** state which artifact is the source of truth for the task (`waves.md` for the current O-wave; `waves-done.md` for a done layer; dumpable IR over `.sd`; UAPI headers for ioctl) so a divergence is resolved toward the authority instead of being "fixed" in the wrong direction.

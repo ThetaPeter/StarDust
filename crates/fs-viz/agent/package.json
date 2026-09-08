@@ -1,0 +1,14 @@
+{
+  "name": "stardust-agent-sidecar",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.31"
+  }
+}
