@@ -2,6 +2,7 @@
 //! strip is not enough. Not a language-wave module.
 
 use std::cell::Cell;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use super::{append_log, wide, work_area};
@@ -297,6 +298,33 @@ fn visible_stardust_hosts() -> Vec<Hwnd> {
 
 pub(super) fn native_host_exists() -> bool {
     !stardust_hosts().is_empty()
+}
+
+fn first_stardust_host() -> Hwnd {
+    if let Some(&h) = visible_stardust_hosts().first() {
+        return h;
+    }
+    stardust_hosts()
+        .into_iter()
+        .next()
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `PostMessage` to `StarDustHost` only. Never `HWND_TOP` / `HWND_TOPMOST`.
+pub(super) fn post_open_cursor_message(msg: u32) -> Result<(), &'static str> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+    if msg == 0 {
+        return Err("RegisterWindowMessage StarDustOpenCursor failed");
+    }
+    let hwnd = first_stardust_host();
+    if hwnd.is_null() {
+        return Err("no StarDustHost");
+    }
+    let ok = unsafe { PostMessageW(hwnd, msg, 0, 0) };
+    if ok == 0 {
+        return Err("PostMessage StarDustOpenCursor failed");
+    }
+    Ok(())
 }
 
 /// True only when every visible host is already a borderless work-area cover.
@@ -667,6 +695,8 @@ fn host_already_frameless(hwnd: Hwnd) -> bool {
 
 thread_local! {
     static IN_COVER_LAYOUT: Cell<bool> = const { Cell::new(false) };
+    static COVER_CBT_HOOK: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    static TASKBAR_LIST2: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 struct CoverLayoutGuard;
@@ -681,8 +711,45 @@ fn class_is_shell_desktop(class: &str) -> bool {
     class.eq_ignore_ascii_case("Progman") || class.eq_ignore_ascii_case("WorkerW")
 }
 
+fn class_is_taskbar(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Shell_TrayWnd")
+        || class.eq_ignore_ascii_case("Shell_SecondaryTrayWnd")
+}
+
+/// Pure class-name check: Weasel / TSF / Cicero candidate UI, never the cover or Chrome.
+/// Equals or contains, case-insensitive. Short marker `IME` is equals-only so `Prime` / taskbar
+/// do not match; longer markers use contains so `WeaselIME_Popup` still yields.
+fn class_looks_like_ime_ui(class: &str) -> bool {
+    let lower = class.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower == "stardusthost" || lower.starts_with("chrome_widgetwin") {
+        return false;
+    }
+    if lower == "ime" {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "weaseltsf",
+        "weaselime",
+        "msctfime ui",
+        "cicerouiwndframe",
+        "tf_floatinglangbar",
+    ];
+    MARKERS.iter().any(|m| lower == *m || lower.contains(m))
+}
+
+fn hwnd_looks_like_ime_ui(hwnd: Hwnd) -> bool {
+    !hwnd.is_null() && class_looks_like_ime_ui(&window_class(hwnd))
+}
+
 fn window_is_shell_desktop(hwnd: Hwnd) -> bool {
     !hwnd.is_null() && class_is_shell_desktop(&window_class(hwnd))
+}
+
+fn window_is_taskbar(hwnd: Hwnd) -> bool {
+    !hwnd.is_null() && class_is_taskbar(&window_class(hwnd))
 }
 
 fn is_cover_peer(hwnd: Hwnd) -> bool {
@@ -764,19 +831,347 @@ fn shell_is_above(hwnd: Hwnd) -> bool {
     }
 }
 
-/// Change cover z-order only when StarDust is foreground (startup / user clicked
-/// the cosmos) or Progman/WorkerW is above the cover (wallpaper hiding cosmos).
-/// Never restack while Chrome is foreground and Cursor is being taskbar-raised:
-/// that `SetWindowPos` parks the cover under Chrome and leaves Cursor below it.
-fn cover_may_change_z_order(self_foreground: bool, shell_above: bool) -> bool {
-    self_foreground || shell_above
+/// Change cover z-order only when Progman/WorkerW is above the cover (wallpaper
+/// hiding cosmos). StarDust foreground / a cosmos click must not restack:
+/// work-area `WS_POPUP` then looks like rude fullscreen and Explorer cloaks
+/// other windows. Never restack while Chrome is foreground and Cursor is being
+/// taskbar-raised. While `opening_cursor`, IME composing, or an IME candidate
+/// HWND is in front, never climb even if Progman/WorkerW is above.
+/// `_self_foreground` is kept so callers/tests stay 5-arg; it is not a restack reason.
+fn cover_may_change_z_order(
+    _self_foreground: bool,
+    shell_above: bool,
+    opening_cursor: bool,
+    composing: bool,
+    ime_ui: bool,
+) -> bool {
+    !opening_cursor && !composing && !ime_ui && shell_above
+}
+
+/// Skip restyle / uncloak / `SetWindowPos` when another **user** app is FG
+/// (exclusive fullscreen). StarDust, Progman/WorkerW, taskbar, and IME UI
+/// are not "other app". IME composing skip is a separate early return.
+fn cover_skip_layout_for_other_app(
+    self_foreground: bool,
+    shell_desktop_fg: bool,
+    taskbar_fg: bool,
+    ime_ui: bool,
+) -> bool {
+    !self_foreground && !shell_desktop_fg && !taskbar_fg && !ime_ui
+}
+
+pub(super) fn ime_ui_is_foreground() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    hwnd_looks_like_ime_ui(unsafe { GetForegroundWindow() })
+}
+
+pub(super) fn other_user_app_is_foreground() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() {
+        return false;
+    }
+    cover_skip_layout_for_other_app(
+        is_cover_peer(fg),
+        window_is_shell_desktop(fg),
+        window_is_taskbar(fg),
+        hwnd_looks_like_ime_ui(fg),
+    )
+}
+
+fn cover_force_frame(force_frame: bool, style_ok: bool) -> bool {
+    force_frame || !style_ok
+}
+
+/// Keep an iconic cover minimized only for exclusive fullscreen / other **user** app FG.
+/// Restore when StarDust, Progman/WorkerW, or the taskbar is foreground.
+/// Tray is not `class_is_shell_desktop`.
+fn cover_keep_minimized(
+    iconic: bool,
+    self_foreground: bool,
+    shell_desktop_fg: bool,
+    taskbar_fg: bool,
+) -> bool {
+    iconic && !self_foreground && !shell_desktop_fg && !taskbar_fg
+}
+
+pub(super) fn cover_non_rude_prop() -> &'static str {
+    "NonRudeHWND"
+}
+
+fn apply_non_rude_one(hwnd: Hwnd) {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetPropW;
+    if hwnd.is_null() {
+        return;
+    }
+    let name = wide(cover_non_rude_prop());
+    unsafe {
+        let _ = SetPropW(hwnd, name.as_ptr(), 1 as HANDLE);
+    }
+}
+
+fn apply_non_rude_tree(hwnd: Hwnd) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindow, GW_CHILD, GW_HWNDNEXT};
+    if hwnd.is_null() {
+        return;
+    }
+    apply_non_rude_one(hwnd);
+    unsafe {
+        let mut child = GetWindow(hwnd, GW_CHILD);
+        while !child.is_null() {
+            apply_non_rude_tree(child);
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
+    }
+}
+
+/// `ITaskbarList2` IID `{602D4995-B13A-429B-A66E-1935E44F4317}`.
+fn iid_itaskbar_list2() -> windows_sys::core::GUID {
+    windows_sys::core::GUID::from_u128(0x602d4995_b13a_429b_a66e_1935e44f4317)
+}
+
+fn cover_mark_fullscreen_false() -> i32 {
+    0
+}
+
+fn cover_taskbar_list2_mark_slot() -> usize {
+    8
+}
+
+fn taskbar_list2_vtbl(obj: *mut c_void) -> *const *const c_void {
+    unsafe { *(obj as *const *const *const c_void) }
+}
+
+fn create_taskbar_list2() -> *mut c_void {
+    use windows_sys::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows_sys::Win32::UI::Shell::TaskbarList;
+    const CO_E_NOTINITIALIZED: i32 = -2147221008;
+    const HR_INIT_SLOT: usize = 3;
+    const RELEASE_SLOT: usize = 2;
+
+    unsafe fn try_create() -> (*mut c_void, i32) {
+        let mut obj: *mut c_void = std::ptr::null_mut();
+        let iid = iid_itaskbar_list2();
+        let hr = CoCreateInstance(
+            &TaskbarList,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &iid,
+            &mut obj,
+        );
+        (obj, hr)
+    }
+
+    let (mut obj, mut hr) = unsafe { try_create() };
+    if hr == CO_E_NOTINITIALIZED {
+        let _ = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        let retry = unsafe { try_create() };
+        obj = retry.0;
+        hr = retry.1;
+    }
+    if hr < 0 || obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let vtbl = taskbar_list2_vtbl(obj);
+        let hr_init: unsafe extern "system" fn(*mut c_void) -> i32 =
+            std::mem::transmute(*vtbl.add(HR_INIT_SLOT));
+        if hr_init(obj) < 0 {
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*vtbl.add(RELEASE_SLOT));
+            let _ = release(obj);
+            return std::ptr::null_mut();
+        }
+    }
+    obj
+}
+
+/// Never `MarkFullscreenWindow(..., TRUE)`. Work-area `WS_POPUP` is not exclusive fullscreen.
+fn mark_cover_not_fullscreen(hwnd: Hwnd) {
+    if hwnd.is_null() {
+        return;
+    }
+    let obj = TASKBAR_LIST2.with(|slot| {
+        let p = slot.get();
+        if !p.is_null() {
+            return p;
+        }
+        let created = create_taskbar_list2();
+        slot.set(created);
+        created
+    });
+    if obj.is_null() {
+        return;
+    }
+    unsafe {
+        let vtbl = taskbar_list2_vtbl(obj);
+        let mark: unsafe extern "system" fn(*mut c_void, Hwnd, i32) -> i32 =
+            std::mem::transmute(*vtbl.add(cover_taskbar_list2_mark_slot()));
+        let _ = mark(obj, hwnd, cover_mark_fullscreen_false());
+    }
+}
+
+/// `NonRudeHWND` on the host and every WebView2 descendant, plus
+/// `ITaskbarList2::MarkFullscreenWindow(hwnd, FALSE)`, so Explorer/DWM do not
+/// treat the work-area popup as rude fullscreen (cloak on cosmos click / Win+D).
+pub(super) fn apply_cover_non_rude(hwnd: Hwnd) {
+    if hwnd.is_null() {
+        return;
+    }
+    apply_non_rude_tree(hwnd);
+    mark_cover_not_fullscreen(hwnd);
+}
+
+fn window_dwm_cloaked(hwnd: Hwnd) -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    if hwnd.is_null() {
+        return false;
+    }
+    let mut cloaked: u32 = 0;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED as u32,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    hr >= 0 && cloaked != 0
+}
+
+fn cover_uncloak(hwnd: Hwnd) {
+    use windows_sys::Win32::Graphics::Dwm::DWMWA_CLOAK;
+    dwm_set_u32(hwnd, DWMWA_CLOAK as u32, 0);
+}
+
+/// Uncloak a DWM-cloaked cover when FG is StarDust, Progman/WorkerW, or the taskbar.
+/// Never uncloak when another **user** app is FG (exclusive fullscreen).
+fn cover_should_uncloak(
+    cloaked: bool,
+    self_foreground: bool,
+    shell_desktop_fg: bool,
+    taskbar_fg: bool,
+) -> bool {
+    cloaked && (self_foreground || shell_desktop_fg || taskbar_fg)
+}
+
+/// Already a visible work-area popup, nothing to restack (Chrome vs Cursor race).
+fn cover_skip_already_cover(already: bool, force: bool, visible: bool, shell_above: bool) -> bool {
+    already && !force && visible && !shell_above
+}
+
+/// Same skips as `on_host_shown` restore: no `restore_stardust_cover_if_wrong`
+/// while composing, IME UI FG, or other-app FG (`WM_WINDOWPOSCHANGED`).
+fn cover_skip_restore_if_wrong(composing: bool, ime_ui_fg: bool, other_app_fg: bool) -> bool {
+    composing || ime_ui_fg || other_app_fg
+}
+
+pub(super) fn skip_restore_if_wrong_now() -> bool {
+    cover_skip_restore_if_wrong(
+        super::ime_composing(),
+        ime_ui_is_foreground(),
+        other_user_app_is_foreground(),
+    )
+}
+
+/// Visible work-area popup buried under Progman/WorkerW: restack, do not restyle.
+fn cover_restack_already_cover(
+    already: bool,
+    force: bool,
+    visible: bool,
+    shell_above: bool,
+) -> bool {
+    already && !force && visible && shell_above
+}
+
+/// Thread CBT: refuse minimize show-cmds on the desktop cover. Allow SW_RESTORE / SW_SHOWNA / SW_SHOW.
+fn cover_cbt_block_minmax(desktop_host: bool, show_cmd: i32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SW_FORCEMINIMIZE, SW_MINIMIZE, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE,
+    };
+    desktop_host
+        && matches!(
+            show_cmd,
+            SW_MINIMIZE | SW_FORCEMINIMIZE | SW_SHOWMINIMIZED | SW_SHOWMINNOACTIVE
+        )
+}
+
+/// Swallow min/max/restore on the desktop cover so Win+D need not iconify it.
+/// Windows UI (`desktop_host` false) still gets DefWindowProc.
+pub(super) fn cover_swallow_minimize(desktop_host: bool, cmd: u32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE};
+    desktop_host && matches!(cmd, SC_MINIMIZE | SC_MAXIMIZE | SC_RESTORE)
+}
+
+const WH_CBT: i32 = 5;
+const HCBT_MINMAX: i32 = 1;
+
+unsafe extern "system" fn cover_cbt_proc(
+    code: i32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::CallNextHookEx;
+    if code == HCBT_MINMAX {
+        let hwnd = wparam as Hwnd;
+        if cover_cbt_block_minmax(is_cover_peer(hwnd), lparam as i32) {
+            return 1;
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+pub(super) fn install_cover_cbt_hook() {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowsHookExW;
+    COVER_CBT_HOOK.with(|slot| {
+        if !slot.get().is_null() {
+            return;
+        }
+        let hook = unsafe {
+            SetWindowsHookExW(
+                WH_CBT,
+                Some(cover_cbt_proc),
+                std::ptr::null_mut(),
+                GetCurrentThreadId(),
+            )
+        };
+        slot.set(hook);
+    });
+}
+
+pub(super) fn uninstall_cover_cbt_hook() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
+    COVER_CBT_HOOK.with(|slot| {
+        let hook = slot.replace(std::ptr::null_mut());
+        if !hook.is_null() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
+    });
 }
 
 /// `WM_WINDOWPOSCHANGING` must not rewrite `hwndInsertAfter` (to `HWND_BOTTOM`
 /// or to Chrome). Neighbor z-shuffles from a taskbar raise share this message;
 /// any cover `SetWindowPos` there cancels Cursor coming in front of Chrome.
-fn cover_changing_should_lock_z(hide: bool, already_no_zorder: bool) -> bool {
-    !hide && !already_no_zorder
+/// Composing / IME **locks** (`SWP_NOZORDER`): Weasel is typically TOPMOST and
+/// yielding let every key move the cover (flash). Hide still does not lock.
+/// `opening_cursor` may still yield (item 21).
+fn cover_changing_should_lock_z(
+    hide: bool,
+    already_no_zorder: bool,
+    composing: bool,
+    opening_cursor: bool,
+) -> bool {
+    if opening_cursor || hide || already_no_zorder {
+        return false;
+    }
+    let _ = composing;
+    true
 }
 
 fn cover_may_change_z(hwnd: Hwnd) -> bool {
@@ -786,7 +1181,13 @@ fn cover_may_change_z(hwnd: Hwnd) -> bool {
     }
     let fg = unsafe { GetForegroundWindow() };
     let self_fg = fg.is_null() || fg == hwnd || is_cover_peer(fg);
-    cover_may_change_z_order(self_fg, shell_is_above(hwnd))
+    cover_may_change_z_order(
+        self_fg,
+        shell_is_above(hwnd),
+        super::opening_cursor(),
+        super::ime_composing(),
+        hwnd_looks_like_ime_ui(fg),
+    )
 }
 
 /// Place just above the shell desktop. `hwndInsertAfter` may be a user app when
@@ -826,10 +1227,15 @@ fn cover_set_window_pos(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32, extra_flags:
 
 /// Refuse every z-order rewrite on the cover, including `HWND_TOP` and
 /// insert-after Chrome. Never `HWND_BOTTOM` Progman/WorkerW.
+/// Layout restack (`IN_COVER_LAYOUT`) must keep its `hwndInsertAfter`.
 pub(super) fn apply_cover_windowpos_changing(hwnd: Hwnd, lparam: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, GWLP_USERDATA, SWP_HIDEWINDOW, SWP_NOZORDER, WINDOWPOS,
+        GetWindowLongPtrW, GetForegroundWindow, GWLP_USERDATA, SWP_HIDEWINDOW, SWP_NOZORDER,
+        WINDOWPOS,
     };
+    if IN_COVER_LAYOUT.get() {
+        return;
+    }
     if hwnd.is_null() || lparam == 0 {
         return;
     }
@@ -840,7 +1246,14 @@ pub(super) fn apply_cover_windowpos_changing(hwnd: Hwnd, lparam: isize) {
     unsafe {
         let hide = (*wp).flags & SWP_HIDEWINDOW != 0;
         let already = (*wp).flags & SWP_NOZORDER != 0;
-        if cover_changing_should_lock_z(hide, already) {
+        let fg = GetForegroundWindow();
+        let ime_ui = hwnd_looks_like_ime_ui(fg) || hwnd_looks_like_ime_ui((*wp).hwndInsertAfter);
+        if cover_changing_should_lock_z(
+            hide,
+            already,
+            super::ime_composing() || ime_ui,
+            super::opening_cursor(),
+        ) {
             (*wp).flags |= SWP_NOZORDER;
         }
     }
@@ -855,15 +1268,54 @@ fn layout_host_desktop(hwnd: Hwnd, force_frame: bool) {
     if IN_COVER_LAYOUT.get() {
         return;
     }
+    let fg = unsafe { GetForegroundWindow() };
+    let ime_ui = hwnd_looks_like_ime_ui(fg);
+    if super::ime_composing() || ime_ui {
+        return;
+    }
+    let self_foreground = fg == hwnd || is_cover_peer(fg);
+    let shell_desktop_fg = window_is_shell_desktop(fg);
+    let taskbar_fg = window_is_taskbar(fg);
+    if !fg.is_null()
+        && cover_skip_layout_for_other_app(self_foreground, shell_desktop_fg, taskbar_fg, ime_ui)
+    {
+        return;
+    }
+    install_cover_cbt_hook();
 
     let cur_style = host_style(hwnd);
+    let style_ok = cover_style_ok(cur_style);
+    let force_frame = cover_force_frame(force_frame, style_ok);
     let iconic = unsafe { IsIconic(hwnd) } != 0;
-    let foreground = unsafe { GetForegroundWindow() } == hwnd;
+    let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+    let shell_above = shell_is_above(hwnd);
     let already_cover =
-        cover_style_ok(cur_style) && (cur_style & WS_MINIMIZE) == 0 && rect_matches_work_area(hwnd);
-    // Do not SetWindowPos / pin on WM_WINDOWPOSCHANGED when the cover is already
-    // a work-area popup — that races Chrome vs taskbar-raised Cursor.
-    if already_cover && !force_frame {
+        style_ok && (cur_style & WS_MINIMIZE) == 0 && rect_matches_work_area(hwnd);
+    let cloaked = window_dwm_cloaked(hwnd);
+    let should_uncloak =
+        cover_should_uncloak(cloaked, self_foreground, shell_desktop_fg, taskbar_fg);
+    apply_cover_non_rude(hwnd);
+    // Hidden cover is not "already cover". Skip SetWindowPos only when visible
+    // and Progman/WorkerW is not above (Chrome vs taskbar-raised Cursor).
+    // A DWM-cloaked cover still looks "already cover" to IsWindowVisible.
+    if cover_skip_already_cover(already_cover, force_frame, visible, shell_above) && !should_uncloak
+    {
+        return;
+    }
+    if cover_restack_already_cover(already_cover, force_frame, visible, shell_above)
+        || (should_uncloak && already_cover && !force_frame)
+    {
+        IN_COVER_LAYOUT.set(true);
+        let _guard = CoverLayoutGuard;
+        if should_uncloak {
+            cover_uncloak(hwnd);
+        }
+        let (x, y, w, h) = work_area();
+        cover_set_window_pos(hwnd, x, y, w, h, 0);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+        }
+        apply_cover_non_rude(hwnd);
         return;
     }
 
@@ -874,10 +1326,10 @@ fn layout_host_desktop(hwnd: Hwnd, force_frame: bool) {
     set_ex_appwindow(hwnd, false);
     dwm_disable_nc(hwnd);
 
-    let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    // Do not ShowWindow/SW_RESTORE an iconic host that is not foreground — that
-    // steals exclusive fullscreen from another app.
-    let keep_minimized = iconic && !foreground;
+    // Exclusive fullscreen / other-app FG: leave the iconic cover minimized.
+    // Show Desktop (Progman/WorkerW or taskbar FG) must restore so clicks hit StarDust.
+    let keep_minimized =
+        cover_keep_minimized(iconic, self_foreground, shell_desktop_fg, taskbar_fg);
     let want_style = if keep_minimized {
         WS_POPUP | WS_VISIBLE | WS_MINIMIZE
     } else {
@@ -889,21 +1341,27 @@ fn layout_host_desktop(hwnd: Hwnd, force_frame: bool) {
         let _ = SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
     }
     if keep_minimized {
+        super::apply_host_window_icons(hwnd, false);
         return;
     }
 
+    if should_uncloak {
+        cover_uncloak(hwnd);
+    }
     let (x, y, w, h) = work_area();
     cover_set_window_pos(hwnd, x, y, w, h, SWP_FRAMECHANGED);
-    if iconic && foreground {
+    if iconic {
         unsafe {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         cover_set_window_pos(hwnd, x, y, w, h, SWP_FRAMECHANGED);
-    } else if visible {
+    } else {
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNA);
         }
     }
+    apply_cover_non_rude(hwnd);
+    super::apply_host_window_icons(hwnd, false);
 }
 
 fn apply_region_clip(hwnd: Hwnd) {
@@ -955,9 +1413,10 @@ pub(super) fn keep_frameless() {
     layout_all_host_covers(true);
 }
 
-/// Re-cover only hosts whose style/rect is not already a clean work-area popup.
-/// Does not pin z-order (`WM_WINDOWPOSCHANGED` neighbor shuffles must not
-/// `SetWindowPos` the cover).
+/// Re-cover hosts that are hidden, iconic, captioned, or buried under Progman/WorkerW.
+/// A visible work-area popup with no shell desktop above is left alone so
+/// neighbor shuffles do not `SetWindowPos` the cover. Captioned hosts are not
+/// "already cover" — `layout_host_desktop` forces a restyle when `!cover_style_ok`.
 pub(super) fn keep_cover_if_wrong() {
     layout_all_host_covers(false);
 }
@@ -1000,6 +1459,7 @@ fn float_one_host(hwnd: Hwnd) {
         let nx = x + (wa_w - w) / 2;
         let ny = y + (wa_h - h) / 2;
         let _ = SetWindowPos(hwnd, HWND_TOP, nx, ny, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        super::apply_host_window_icons(hwnd, true);
     }
 }
 
@@ -1053,33 +1513,229 @@ mod cover_logic_tests {
     #[test]
     fn cover_does_not_restack_during_other_app_raise() {
         assert!(
-            !super::cover_may_change_z_order(false, false),
+            !super::cover_may_change_z_order(false, false, false, false, false),
             "Chrome foreground + Cursor taskbar raise must not SetWindowPos the cover"
         );
         assert!(
-            super::cover_may_change_z_order(true, false),
-            "StarDust foreground (startup / click cosmos) may place above wallpaper"
+            !super::cover_may_change_z_order(true, false, false, false, false),
+            "StarDust foreground / click cosmos must not restack (rude fullscreen cloak)"
         );
         assert!(
-            super::cover_may_change_z_order(false, true),
+            super::cover_may_change_z_order(false, true, false, false, false),
             "Progman/WorkerW above the cover may place above wallpaper"
         );
+        assert!(
+            !super::cover_may_change_z_order(true, false, true, false, false),
+            "StarDust FG but opening Cursor must not climb"
+        );
+        assert!(
+            super::cover_may_change_z_order(true, true, false, false, false),
+            "shell_above still restacks (Win+D) even if StarDust is also FG"
+        );
+    }
+
+    #[test]
+    fn cover_may_change_z_order_yields_for_ime() {
+        assert!(
+            !super::cover_may_change_z_order(true, false, false, true, false),
+            "composing must not climb"
+        );
+        assert!(
+            !super::cover_may_change_z_order(true, false, false, false, true),
+            "IME candidate hwnd must not climb"
+        );
+        assert!(
+            !super::cover_may_change_z_order(false, true, false, false, true),
+            "IME hwnd even if Progman/WorkerW is above"
+        );
+    }
+
+    #[test]
+    fn class_looks_like_ime_ui_weasel_and_tsf_not_host_or_chrome() {
+        assert!(super::class_looks_like_ime_ui("WeaselTSF"));
+        assert!(super::class_looks_like_ime_ui("weaseltsf"));
+        assert!(super::class_looks_like_ime_ui("WeaselIME"));
+        assert!(super::class_looks_like_ime_ui("MSCTFIME UI"));
+        assert!(super::class_looks_like_ime_ui("IME"));
+        assert!(super::class_looks_like_ime_ui("CiceroUIWndFrame"));
+        assert!(super::class_looks_like_ime_ui("TF_FloatingLangBar"));
+        assert!(!super::class_looks_like_ime_ui("StarDustHost"));
+        assert!(!super::class_looks_like_ime_ui("Chrome_WidgetWin_1"));
+        assert!(!super::class_looks_like_ime_ui("chrome_widgetwin_1"));
+        assert!(!super::class_looks_like_ime_ui("Shell_TrayWnd"));
+        assert!(!super::class_looks_like_ime_ui(""));
+    }
+
+    #[test]
+    fn captioned_host_forces_cover_frame() {
+        assert!(
+            super::cover_force_frame(false, false),
+            "keep_cover_if_wrong must restyle when !cover_style_ok"
+        );
+        assert!(super::cover_force_frame(true, true));
+        assert!(!super::cover_force_frame(false, true));
     }
 
     #[test]
     fn cover_windowpos_changing_locks_z_and_never_inserts_after_chrome() {
         assert!(
-            super::cover_changing_should_lock_z(false, false),
+            super::cover_changing_should_lock_z(false, false, false, false),
             "neighbor shuffle / HWND_TOP must become SWP_NOZORDER"
         );
         assert!(
-            !super::cover_changing_should_lock_z(true, false),
+            super::cover_changing_should_lock_z(false, false, true, false),
+            "IME/RIME composing must lock z-order (Weasel TOPMOST; do not yield)"
+        );
+        assert!(
+            !super::cover_changing_should_lock_z(true, false, false, false),
             "hide may keep its z-order flags"
         );
         assert!(
-            !super::cover_changing_should_lock_z(false, true),
+            !super::cover_changing_should_lock_z(false, true, false, false),
             "already SWP_NOZORDER stays as-is"
         );
+        assert!(
+            !super::cover_changing_should_lock_z(true, false, true, false),
+            "hide still skips lock while composing"
+        );
+        assert!(
+            !super::cover_changing_should_lock_z(false, true, true, false),
+            "already SWP_NOZORDER still skips lock while composing"
+        );
+        assert!(
+            !super::cover_changing_should_lock_z(false, false, false, true),
+            "opening_cursor may still yield (item 21)"
+        );
+        assert!(
+            !super::cover_changing_should_lock_z(false, false, true, true),
+            "opening_cursor yield wins even while composing"
+        );
+    }
+
+    #[test]
+    fn cover_keep_minimized_restores_on_show_desktop() {
+        assert!(
+            super::cover_keep_minimized(true, false, false, false),
+            "exclusive fullscreen / other-app FG must keep the iconic cover minimized"
+        );
+        assert!(!super::cover_keep_minimized(true, true, false, false));
+        assert!(
+            !super::cover_keep_minimized(true, false, true, false),
+            "Win+D / Progman FG must not keep the cover iconic"
+        );
+        assert!(
+            !super::cover_keep_minimized(true, false, false, true),
+            "taskbar FG after Show Desktop must restore the cover"
+        );
+        assert!(!super::cover_keep_minimized(false, false, false, false));
+    }
+
+    #[test]
+    fn cover_skip_and_restack_already_cover() {
+        assert!(
+            super::cover_skip_already_cover(true, false, true, false),
+            "already+visible+!shell+!force must skip SetWindowPos"
+        );
+        assert!(
+            super::cover_restack_already_cover(true, false, true, true),
+            "already+visible+shell_above+!force must restack"
+        );
+        assert!(
+            !super::cover_skip_already_cover(true, false, false, false),
+            "hidden cover is not already-cover skip"
+        );
+        assert!(!super::cover_restack_already_cover(true, false, false, true));
+        assert!(!super::cover_skip_already_cover(true, true, true, false));
+        assert!(!super::cover_restack_already_cover(true, true, true, true));
+    }
+
+    #[test]
+    fn cover_cbt_blocks_minimize_not_restore() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_RESTORE};
+        assert!(super::cover_cbt_block_minmax(true, SW_MINIMIZE));
+        assert!(!super::cover_cbt_block_minmax(true, SW_RESTORE));
+        assert!(!super::cover_cbt_block_minmax(false, SW_MINIMIZE));
+    }
+
+    #[test]
+    fn cover_swallow_minimize_only_desktop_host_syscommands() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SC_MINIMIZE, SC_RESTORE};
+        assert!(super::cover_swallow_minimize(true, SC_MINIMIZE));
+        assert!(super::cover_swallow_minimize(true, SC_RESTORE));
+        assert!(!super::cover_swallow_minimize(false, SC_MINIMIZE));
+        assert!(!super::cover_swallow_minimize(true, 0));
+    }
+
+    #[test]
+    fn cover_non_rude_prop_is_non_rude_hwnd() {
+        assert_eq!(super::cover_non_rude_prop(), "NonRudeHWND");
+        assert_eq!(super::cover_mark_fullscreen_false(), 0, "never MarkFullscreenWindow TRUE");
+        assert_eq!(super::cover_taskbar_list2_mark_slot(), 8);
+        assert_eq!(super::iid_itaskbar_list2().data1, 0x602d4995);
+    }
+
+    #[test]
+    fn cover_skips_restore_while_composing_ime_or_other_app() {
+        assert!(
+            super::cover_skip_restore_if_wrong(true, false, false),
+            "composing must skip WM_WINDOWPOSCHANGED restore"
+        );
+        assert!(
+            super::cover_skip_restore_if_wrong(false, true, false),
+            "IME UI FG must skip WM_WINDOWPOSCHANGED restore"
+        );
+        assert!(
+            super::cover_skip_restore_if_wrong(false, false, true),
+            "other-app FG must skip WM_WINDOWPOSCHANGED restore"
+        );
+        assert!(!super::cover_skip_restore_if_wrong(false, false, false));
+    }
+
+    #[test]
+    fn cover_skips_layout_when_other_app_foreground() {
+        assert!(
+            super::cover_skip_layout_for_other_app(false, false, false, false),
+            "Chrome / exclusive-fullscreen FG must not restyle the cover"
+        );
+        assert!(
+            !super::cover_skip_layout_for_other_app(true, false, false, false),
+            "StarDust FG is not other-app skip"
+        );
+        assert!(
+            !super::cover_skip_layout_for_other_app(false, true, false, false),
+            "Progman/WorkerW FG is not other-app skip"
+        );
+        assert!(
+            !super::cover_skip_layout_for_other_app(false, false, true, false),
+            "taskbar FG is not other-app skip"
+        );
+        assert!(
+            !super::cover_skip_layout_for_other_app(false, false, false, true),
+            "IME UI is not other-app skip (composing/ime_ui lock-z is separate)"
+        );
+    }
+
+    #[test]
+    fn cover_uncloak_when_cloaked_shell_taskbar_or_self() {
+        assert!(
+            super::cover_should_uncloak(true, true, false, false),
+            "cloaked + StarDust FG must uncloak"
+        );
+        assert!(
+            super::cover_should_uncloak(true, false, true, false),
+            "cloaked + Progman/WorkerW FG must uncloak"
+        );
+        assert!(
+            super::cover_should_uncloak(true, false, false, true),
+            "cloaked + taskbar FG must uncloak"
+        );
+        assert!(
+            !super::cover_should_uncloak(true, false, false, false),
+            "cloaked + other-app FG must stay cloaked"
+        );
+        assert!(!super::cover_should_uncloak(false, true, false, false));
+        assert!(!super::cover_should_uncloak(false, false, true, false));
+        assert!(!super::cover_should_uncloak(false, false, false, true));
     }
 
     #[test]

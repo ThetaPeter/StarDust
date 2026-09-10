@@ -58,13 +58,16 @@ fn main() {
 
     // Committed stardust.ico is derived: knockout paper, black ink → #FFFFFF,
     // transparent (no plate). luna-silhouette.png stays black artwork.
+    // Windows UI caption: stardust-caption.ico (same knockout, ink stays black).
     // Regen: crates/fs-viz/assets/gen_stardust_ico.py (Pillow).
     let ico = manifest_dir.join("assets").join("stardust.ico");
+    let caption_ico = manifest_dir.join("assets").join("stardust-caption.ico");
     let png = manifest_dir
         .join("..")
         .join("..")
         .join("luna-silhouette.png");
     println!("cargo:rerun-if-changed={}", ico.display());
+    println!("cargo:rerun-if-changed={}", caption_ico.display());
     println!("cargo:rerun-if-changed={}", png.display());
 
     if target.contains("windows") {
@@ -87,6 +90,15 @@ fn main() {
             panic!(
                 "missing Windows icon {} — needed as PE RT_GROUP_ICON for the taskbar",
                 ico.display()
+            );
+        }
+        if caption_ico.is_file() {
+            let _ = std::fs::copy(&caption_ico, exe_dir.join("stardust-caption.ico"));
+            let _ = std::fs::copy(&caption_ico, exe_dir.join("deps").join("stardust-caption.ico"));
+        } else {
+            panic!(
+                "missing Windows caption icon {} — regen with gen_stardust_ico.py",
+                caption_ico.display()
             );
         }
     }

@@ -59,21 +59,77 @@ body {
 #app > *:not(#agent-strip) { position: relative; z-index: 1; }
 #app > #topbar { z-index: 60; overflow: visible; }
 
+#star-drag-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 48px;
+  height: 48px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+  z-index: 10000;
+  display: none;
+  transform: translate(-50%, -50%);
+  image-rendering: auto;
+}
+#star-drag-ghost.on {
+  display: block;
+}
+
 #topbar {
   height: var(--top-h);
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
+  justify-items: start;
+  column-gap: 16px;
   padding: 0 8px;
   background: var(--chrome);
   border: none;
   box-shadow: var(--inset);
   flex-shrink: 0;
+  position: relative;
 }
-.menubar { display: flex; align-items: center; gap: 2px; }
+.menubar { display: flex; align-items: center; gap: 2px; min-width: 0; }
+#brand {
+  justify-self: center;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--top-h);
+  padding: 0 8px;
+  margin: 0;
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  appearance: none;
+  z-index: 2;
+}
+#brand:hover {
+  background: rgba(18, 28, 46, 0.9);
+  border-color: transparent;
+  color: var(--accent);
+}
+#brand img { width: 18px; height: 18px; display: block; flex-shrink: 0; }
+#brand-wordmark {
+  font: inherit;
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: 0;
+  color: inherit;
+  white-space: nowrap;
+  position: relative;
+  top: 3px;
+}
 .menu { position: relative; }
 .menu-btn, .icon-btn, .vbtns button, .crumb button, .dtab, #pin button,
-#agent-send, #agent-stop, #agent-new, #agent-toggle, #agent-history, #agent-rules-btn, .modal-card button, .float-title button {
+#agent-send, #agent-stop, #agent-new, #agent-toggle, #agent-history, .modal-card button, .float-title button {
   font: inherit;
   color: var(--text);
   background: rgba(6, 9, 16, 0.35);
@@ -95,7 +151,7 @@ body {
   border: none;
   box-shadow: var(--inset);
 }
-#search { position: relative; flex: 1; max-width: 420px; z-index: 1; margin-left: auto; }
+#search { position: relative; justify-self: end; width: 220px; max-width: 220px; min-width: 0; z-index: 1; }
 #search-input {
   width: 100%;
   font: inherit;
@@ -188,10 +244,6 @@ body {
 }
 .menu .submenu:hover .nested,
 .menu .submenu:focus-within .nested { display: block; }
-#menu-view #btn-ui-mode {
-  position: relative;
-  z-index: 140;
-}
 
 #ctx {
   position: fixed;
@@ -396,6 +448,12 @@ html.shell-desktop #pin {
 .crumb-sep { color: var(--muted); }
 .vbtns { display: flex; gap: 2px; }
 .vbtns button { padding: 2px 7px; color: var(--accent); }
+.vbtns [data-act="split"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.vbtns [data-act="split"] svg { display: block; }
 .vbtns button:disabled { color: #5c6a84; cursor: default; }
 .vbtns button:disabled:hover { background: transparent; border-color: transparent; }
 .vstage { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
@@ -661,10 +719,6 @@ html.shell-desktop #pin {
   max-height: 280px;
   overflow: auto;
 }
-#agent-rules-pop {
-  min-width: 260px;
-  padding: 8px;
-}
 .agent-title:focus { box-shadow: inset 0 0 0 1px rgba(120, 170, 255, 0.35); border-radius: 4px; }
 .agent-title input,
 .agent-title-edit {
@@ -807,8 +861,7 @@ html.shell-desktop #pin {
 }
 .chip button { border: none; background: none; color: var(--muted); cursor: pointer; padding: 0 2px; }
 .agent-compose { border: none; padding: 8px; box-shadow: inset 0 10px 16px rgba(0, 0, 0, 0.28); }
-#agent-input,
-#agent-rules {
+#agent-input {
   width: 100%;
   resize: none;
   font: inherit;
@@ -820,8 +873,7 @@ html.shell-desktop #pin {
   outline: none;
   box-shadow: var(--inset);
 }
-#agent-input:focus,
-#agent-rules:focus { box-shadow: var(--inset-focus); }
+#agent-input:focus { box-shadow: var(--inset-focus); }
 .agent-bar { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
 #agent-mode,
 #agent-model {
@@ -854,17 +906,11 @@ html.shell-desktop #pin {
   border-right: none;
   border-radius: 8px 0 0 8px;
   box-shadow: var(--inset), var(--lift);
-  color: var(--accent);
+  color: var(--text);
   cursor: pointer;
 }
-.agent-tab-tri {
-  display: block;
-  width: 0;
-  height: 0;
-  border-top: 6px solid transparent;
-  border-bottom: 6px solid transparent;
-  border-right: 8px solid var(--accent);
-}
+#agent-strip:hover { color: var(--accent); }
+#agent-strip svg { display: block; }
 
 #pin {
   height: var(--pin-h);

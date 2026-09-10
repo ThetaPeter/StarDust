@@ -8,7 +8,6 @@
       const msgsEl = document.getElementById("agent-msgs");
       const chipsEl = document.getElementById("agent-chips");
       const input = document.getElementById("agent-input");
-      const rulesEl = document.getElementById("agent-rules");
       const modeEl = document.getElementById("agent-mode");
       const modelEl = document.getElementById("agent-model");
       const sendBtn = document.getElementById("agent-send");
@@ -19,8 +18,6 @@
       const sash = document.getElementById("agent-sash");
       const historyBtn = document.getElementById("agent-history");
       const historyPop = document.getElementById("agent-history-pop");
-      const rulesBtn = document.getElementById("agent-rules-btn");
-      const rulesPop = document.getElementById("agent-rules-pop");
 
       const st = {
         agentName: "Agent",
@@ -79,17 +76,13 @@
 
       function closeAgentPops() {
         if (historyPop) historyPop.hidden = true;
-        if (rulesPop) rulesPop.hidden = true;
       }
 
       function toggleAgentPop(pop) {
         if (!pop) return;
         const open = pop.hidden;
         closeAgentPops();
-        if (open) {
-          pop.hidden = false;
-          if (pop === rulesPop && rulesEl) setTimeout(() => rulesEl.focus(), 0);
-        }
+        if (open) pop.hidden = false;
       }
 
       function cancelEdit() {
@@ -136,13 +129,9 @@
         renderMsgs();
       }
 
-      const DEFAULT_AGENT_RULES =
-        "Never move, rename, copy-away, relocate, or amend Windows AppData (Roaming, Local, or LocalLow), including %APPDATA%\\StarDust. Do not Write, Shell, copy, or delete under those trees.";
-
       function collectHistory() {
         return {
           agentName: st.agentName || "Agent",
-          agentRules: rulesEl ? rulesEl.value : "",
           current: st.current,
           threads: st.threads.map((t) => ({
             id: t.id,
@@ -705,6 +694,9 @@
         if (!t) return;
         cancelEdit();
         try {
+          await app.api.post("/api/agent/stop-all", {});
+        } catch (_) {}
+        try {
           if (!t.local && String(t.id).indexOf("local-") !== 0) {
             await app.api.delete("/api/agent/threads/" + encodeURIComponent(t.id));
           }
@@ -795,20 +787,12 @@
         return id;
       }
 
-      function normalizeAgentRules(hist) {
-        if (!hist || typeof hist !== "object" || !Object.prototype.hasOwnProperty.call(hist, "agentRules")) {
-          return DEFAULT_AGENT_RULES;
-        }
-        return typeof hist.agentRules === "string" ? hist.agentRules : "";
-      }
-
       function normalizeHistory(raw) {
         if (!raw || typeof raw !== "object") {
-          return { agentName: "Agent", agentRules: DEFAULT_AGENT_RULES, current: null, threads: [] };
+          return { agentName: "Agent", current: null, threads: [] };
         }
         const hist = raw.history && typeof raw.history === "object" ? raw.history : raw;
         const name = typeof hist.agentName === "string" && hist.agentName.trim() ? hist.agentName.trim() : "Agent";
-        const agentRules = normalizeAgentRules(hist);
         const arr = Array.isArray(hist.threads) ? hist.threads : [];
         const threads = arr
           .map((rawT) => {
@@ -837,13 +821,14 @@
             : threads[0]
               ? threads[0].id
               : null;
-        return { agentName: name, agentRules, current, threads };
+        return { agentName: name, current, threads };
       }
 
       async function loadHistory() {
-        let hist = { agentName: "Agent", agentRules: DEFAULT_AGENT_RULES, current: null, threads: [] };
+        let hist = { agentName: "Agent", current: null, threads: [] };
         try {
-          hist = normalizeHistory(await app.api.get("/api/agent-history"));
+          const raw = await app.api.get("/api/agent-history");
+          hist = normalizeHistory(raw);
         } catch (_) {}
         if (!hist.threads.length && Array.isArray(app.state.threads) && app.state.threads.length) {
           hist.threads = app.state.threads
@@ -862,7 +847,6 @@
         st.agentName = hist.agentName || "Agent";
         st.threads = hist.threads;
         st.current = hist.current;
-        if (rulesEl) rulesEl.value = hist.agentRules != null ? hist.agentRules : DEFAULT_AGENT_RULES;
         const before = st.threads.length;
         const kept = st.threads.filter((t) => !isEmptyUntitled(t));
         if (kept.length) st.threads = kept;
@@ -1136,7 +1120,7 @@
           t.model = model;
           t.agentMode = agentMode;
         }
-        const body = { prompt, attachments, model, mode: agentMode, rules: rulesEl ? rulesEl.value : "" };
+        const body = { prompt, attachments, model, mode: agentMode };
         const url = "/api/agent/threads/" + encodeURIComponent(st.current) + "/stream";
         try {
           const res = await fetch(url, {
@@ -1240,9 +1224,7 @@
 
       async function stop() {
         try {
-          if (st.current) {
-            await app.api.post("/api/agent/threads/" + encodeURIComponent(st.current) + "/stop", {});
-          }
+          await app.api.post("/api/agent/stop-all", {});
         } catch (_) {}
         stopStream();
         removeThinkingActions();
@@ -1282,9 +1264,6 @@
           scheduleHistorySave();
         });
       }
-      if (rulesEl) {
-        rulesEl.addEventListener("input", scheduleHistorySave);
-      }
       document.getElementById("agent-new").onclick = () => newThread();
       toggle.onclick = () => setOpen(false);
       strip.onclick = () => setOpen(true);
@@ -1295,21 +1274,10 @@
           toggleAgentPop(historyPop);
         });
       }
-      if (rulesBtn && rulesPop) {
-        rulesBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          toggleAgentPop(rulesPop);
-        });
-      }
       document.addEventListener("mousedown", (e) => {
         if (historyPop && !historyPop.hidden) {
           if (!historyPop.contains(e.target) && historyBtn && !historyBtn.contains(e.target)) {
             historyPop.hidden = true;
-          }
-        }
-        if (rulesPop && !rulesPop.hidden) {
-          if (!rulesPop.contains(e.target) && rulesBtn && !rulesBtn.contains(e.target)) {
-            rulesPop.hidden = true;
           }
         }
       });

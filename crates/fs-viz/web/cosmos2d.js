@@ -1,6 +1,92 @@
 (function () {
   const GOLDEN = 2.399963229728653;
 
+  function starDragGhostEl() {
+    let el = document.getElementById("star-drag-ghost");
+    if (!el) {
+      el = document.createElement("img");
+      el.id = "star-drag-ghost";
+      el.alt = "";
+      el.draggable = false;
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+
+  window.SDStarDrag = {
+    capture(star, r) {
+      const Look = window.SDLook;
+      const rad = Math.max(8, r || 12);
+      // File paintFileStar bloom/spikes go to ~5.6×r; a tight pad clips to a square.
+      const pad = Math.ceil(rad * (star && star.kind === "dir" ? 3.4 : 6.2));
+      const c = document.createElement("canvas");
+      c.width = pad * 2;
+      c.height = pad * 2;
+      const ctx = c.getContext("2d");
+      const x = pad;
+      const y = pad;
+      const glyph = star && star.glyph;
+      let painted = false;
+      if (glyph && glyph.image) {
+        const im = new Image();
+        im.src = glyph.image;
+        if (im.complete && im.naturalWidth) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(x, y, pad * 0.52, 0, Math.PI * 2);
+          ctx.clip();
+          const side = rad * (star.kind === "dir" ? 3.2 : 2.6);
+          ctx.drawImage(im, x - side / 2, y - side / 2, side, side);
+          ctx.restore();
+          painted = true;
+        }
+      }
+      if (!painted && Look && star) {
+        const hsh = Look.hashName(star.name);
+        const phase = star.twinkle0 || 0;
+        if (star.kind === "dir") {
+          Look.paintDirNebula(ctx, x, y, rad, {
+            on: true,
+            breathe: 1,
+            style: (glyph && glyph.dirStyle) || star.dirStyle || Look.dirStyle(star.name),
+            rot: phase * 0.4,
+            seed: hsh,
+          });
+        } else {
+          const look = Look.starLook(star.name);
+          Look.paintFileStar(ctx, x, y, rad, {
+            on: true,
+            twinkle: 1,
+            spec: (glyph && glyph.spec) || look.spec,
+            morph: (glyph && glyph.morph) || look.morph,
+          });
+        }
+        painted = true;
+      }
+      if (!painted) {
+        ctx.fillStyle = "rgba(180, 220, 255, 0.9)";
+        ctx.beginPath();
+        ctx.arc(x, y, rad, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      return { url: c.toDataURL("image/png"), size: pad * 2 };
+    },
+    show(ghost, cx, cy) {
+      if (!ghost) return;
+      const el = starDragGhostEl();
+      if (el.getAttribute("src") !== ghost.url) el.src = ghost.url;
+      el.style.width = ghost.size + "px";
+      el.style.height = ghost.size + "px";
+      el.style.left = cx + "px";
+      el.style.top = cy + "px";
+      el.classList.add("on");
+    },
+    hide() {
+      const el = document.getElementById("star-drag-ghost");
+      if (el) el.classList.remove("on");
+    },
+  };
+
   function paneDebt(k, w, h) {
     const short = Math.max(96, Math.min(w, h));
     return k * (720 / short);
@@ -202,6 +288,7 @@
         frozen: {},
         arranged: false,
         sel: new Set(),
+        searchSel: new Set(),
         anchor: null,
         hover: null,
         highlight: null,
@@ -440,19 +527,18 @@
         else if (key === "size") items.sort((a, b) => (b.size || 0) - (a.size || 0));
         const n = items.length;
         if (!n) return;
-        if (n <= 14) {
-          const r = 40 + n * 12;
-          items.forEach((s, i) => {
-            const a = (i / n) * Math.PI * 2 - Math.PI / 2;
-            s.x = Math.cos(a) * r;
-            s.y = Math.sin(a) * r;
-          });
-        } else {
-          items.forEach((s, i) => {
-            s.x = (i - (n - 1) / 2) * 88;
-            s.y = (i % 2 === 0 ? -28 : 28);
-          });
-        }
+        const cellW = 96;
+        const cellH = 84;
+        const scale = Math.max(0.18, self.cam.scale || 1);
+        const fitCols = Math.max(1, Math.floor((((self.w || 480) / scale) * 0.84) / cellW));
+        const cols = Math.max(1, Math.min(n, fitCols));
+        const rows = Math.ceil(n / cols);
+        const x0 = self.cam.x - ((cols - 1) * cellW) / 2;
+        const y0 = self.cam.y - ((rows - 1) * cellH) / 2;
+        items.forEach((s, i) => {
+          s.x = x0 + (i % cols) * cellW;
+          s.y = y0 + Math.floor(i / cols) * cellH;
+        });
         self.arranged = true;
       }
 
@@ -477,6 +563,19 @@
       function announceSel() {
         if (h.onSelect)
           h.onSelect([...self.sel].map((n) => self.stars.find((s) => s.name === n)).filter(Boolean));
+      }
+
+      function applyModClick(s, e) {
+        if (!s) return;
+        if (e.shiftKey && self.anchor) {
+          spatialRange(self.anchor, s).forEach((st) => self.sel.add(st.name));
+        } else if (self.sel.has(s.name)) {
+          self.sel.delete(s.name);
+        } else {
+          self.sel.add(s.name);
+        }
+        self.anchor = s;
+        announceSel();
       }
 
       function draw() {
@@ -509,14 +608,16 @@
         }
         const cnsLabelsOpen = !self.hostLayout || cnsVis <= 35 || self.cam.scale * 5 >= 36;
         for (const s of self.stars) {
+          if (self.drag && self.drag.kind === "star" && self.drag.moved && self.drag.star === s) continue;
           const p = toScreen(s);
           if (p.x < -50 || p.y < -50 || p.x > w + 50 || p.y > hgt + 50) continue;
           const r = starR(s);
+          const picked = self.sel.has(s.name) || self.searchSel.has(s.name);
           const on =
             self.hover === s ||
             self.highlight === s.name ||
             self.highlightParent === s.name ||
-            self.sel.has(s.name);
+            picked;
           const phase = s.twinkle0 || 0;
           const glyph = s.glyph;
           const word = isCnsWord(s);
@@ -554,7 +655,7 @@
               });
             }
           }
-          if (self.sel.has(s.name)) {
+          if (picked) {
             ctx.save();
             ctx.globalCompositeOperation = "lighter";
             const hr = r * (s.kind === "dir" ? 2.6 : 3.8);
@@ -600,7 +701,7 @@
           ctx.textBaseline = "top";
           ctx.shadowColor = word ? "rgba(0,0,0,0.7)" : "rgba(0,0,0,0.92)";
           ctx.shadowBlur = word ? 3 : 7;
-          if (self.sel.has(s.name)) {
+          if (picked) {
             const tw = ctx.measureText(s.name).width;
             const bx = p.x - tw / 2 - 5;
             const by = p.y + r + 5;
@@ -867,6 +968,12 @@
           star: s,
           lx: e.clientX,
           ly: e.clientY,
+          px: e.clientX,
+          py: e.clientY,
+          grabX: s ? s.x : 0,
+          grabY: s ? s.y : 0,
+          lastClient: { x: e.clientX, y: e.clientY },
+          ghost: null,
           moved: false,
           sx: e.clientX - r.left,
           sy: e.clientY - r.top,
@@ -896,47 +1003,84 @@
           self.drag.lx = e.clientX;
           self.drag.ly = e.clientY;
           if (h.onCamera) h.onCamera(self.cam);
-        } else if (self.drag.kind === "star" && self.drag.star) {
-          const st = self.drag.star;
-          st.x += dx / self.cam.scale;
-          st.y += dy / self.cam.scale;
-          if (!self.arranged) self.frozen[st.name] = { x: st.x, y: st.y };
-          self.drag.lx = e.clientX;
-          self.drag.ly = e.clientY;
+        } else if (self.drag.kind === "star") {
+          moveStarFromGrab(e);
         } else if (self.drag.kind === "marquee") {
           setMarquee(self.drag.sx, self.drag.sy, self.mouse.x, self.mouse.y);
         }
       });
 
+      function pointerInContainer(cx, cy) {
+        const r = container.getBoundingClientRect();
+        return cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+      }
+
+      function eventAt(e, d) {
+        const fallback = d && d.lastClient;
+        const invalid = !e || ((e.clientX === 0 && e.clientY === 0) && fallback);
+        return {
+          clientX: invalid ? fallback.x : e.clientX,
+          clientY: invalid ? fallback.y : e.clientY,
+          button: e && typeof e.button === "number" ? e.button : 0,
+          pointerId: e && e.pointerId,
+          ctrlKey: !!(e && e.ctrlKey),
+          metaKey: !!(e && e.metaKey),
+          shiftKey: !!(e && e.shiftKey),
+        };
+      }
+
+      function hideStarGhost() {
+        if (window.SDStarDrag) window.SDStarDrag.hide();
+      }
+
+      function moveStarFromGrab(e) {
+        const d = self.drag;
+        if (!d || d.kind !== "star" || !d.star) return;
+        d.lastClient = { x: e.clientX, y: e.clientY };
+        if (Math.hypot(e.clientX - d.px, e.clientY - d.py) > 3) d.moved = true;
+        if (pointerInContainer(e.clientX, e.clientY)) {
+          const st = d.star;
+          st.x = d.grabX + (e.clientX - d.px) / self.cam.scale;
+          st.y = d.grabY + (e.clientY - d.py) / self.cam.scale;
+          if (!self.arranged) self.frozen[st.name] = { x: st.x, y: st.y };
+        }
+        if (d.moved && window.SDStarDrag) {
+          if (!d.ghost) d.ghost = window.SDStarDrag.capture(d.star, starR(d.star));
+          window.SDStarDrag.show(d.ghost, e.clientX, e.clientY);
+        }
+      }
+
       function endDrag(e) {
         if (!self.drag) return;
         const d = self.drag;
+        const ev = eventAt(e, d);
         self.drag = null;
         hideMarquee();
+        hideStarGhost();
         try {
-          container.releasePointerCapture(e.pointerId);
+          container.releasePointerCapture(ev.pointerId);
         } catch (_) {}
         if (
-          e.button === 0 &&
+          ev.button === 0 &&
           !d.moved &&
           d.kind !== "dblpan" &&
           d.kind !== "nav" &&
           d.kind !== "pan"
         ) {
-          self.lastClick = { t: performance.now(), x: e.clientX, y: e.clientY };
+          self.lastClick = { t: performance.now(), x: ev.clientX, y: ev.clientY };
         } else {
           self.lastClick = null;
         }
         if (d.kind === "star" && d.moved) {
-          if (!self.arranged) emitPos();
-          if (h.onStarDragEnd) h.onStarDragEnd(d.star, e);
+          const fileMove = h.onStarDragEnd ? h.onStarDragEnd(d.star, ev) : false;
+          if (!self.arranged && !fileMove) emitPos();
           return;
         }
         if (d.kind === "pan") return;
         if (d.kind === "marquee") {
           const r = container.getBoundingClientRect();
-          const x1 = e.clientX - r.left;
-          const y1 = e.clientY - r.top;
+          const x1 = ev.clientX - r.left;
+          const y1 = ev.clientY - r.top;
           const minx = Math.min(d.sx, x1);
           const maxx = Math.max(d.sx, x1);
           const miny = Math.min(d.sy, y1);
@@ -945,7 +1089,7 @@
             const p = toScreen(st);
             return p.x >= minx && p.x <= maxx && p.y >= miny && p.y <= maxy;
           });
-          const add = e.ctrlKey || e.metaKey || e.shiftKey;
+          const add = ev.ctrlKey || ev.metaKey || ev.shiftKey;
           if (!hits.length) {
             if (!add) {
               self.sel.clear();
@@ -961,10 +1105,8 @@
           return;
         }
         if (d.moved) return;
-        if (d.kind === "nav" || isNav(e)) {
-          const s = d.star || hit(e.clientX, e.clientY);
-          if (s && s.kind === "dir") enterStar(s);
-          else if (!s) leaveScene();
+        if (d.kind === "nav" || isNav(ev)) {
+          applyModClick(d.star || hit(ev.clientX, ev.clientY), ev);
           return;
         }
         const s = d.star;
@@ -974,7 +1116,7 @@
           announceSel();
           return;
         }
-        if (e.shiftKey && self.anchor) {
+        if (ev.shiftKey && self.anchor) {
           self.sel = new Set(spatialRange(self.anchor, s).map((x) => x.name));
         } else {
           self.sel = new Set([s.name]);
@@ -984,9 +1126,22 @@
       }
 
       bind(container, "pointerup", endDrag);
-      bind(container, "pointercancel", () => {
-        hideMarquee();
-        self.drag = null;
+      bind(container, "pointercancel", (e) => {
+        if (self.drag && self.drag.kind === "star") endDrag(e);
+        else {
+          hideMarquee();
+          hideStarGhost();
+          self.drag = null;
+        }
+      });
+      bind(window, "pointermove", (e) => {
+        if (self.drag && self.drag.kind === "star") moveStarFromGrab(e);
+      });
+      bind(window, "pointerup", (e) => {
+        if (self.drag) endDrag(e);
+      });
+      bind(window, "pointercancel", (e) => {
+        if (self.drag && self.drag.kind === "star") endDrag(e);
       });
 
       bind(container, "dblclick", (e) => {
@@ -1080,6 +1235,9 @@
             self.highlight = null;
           }
         },
+        previewSelection(names) {
+          self.searchSel = new Set(names || []);
+        },
         selectNames(names) {
           self.sel = new Set(names || []);
           announceSel();
@@ -1119,6 +1277,7 @@
           if (!self.live) {
             self.drag = null;
             hideMarquee();
+            hideStarGhost();
           }
         },
         canvas,

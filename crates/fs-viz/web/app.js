@@ -155,6 +155,7 @@
     threeFailed: false,
     lastFocus: "view",
     ephemeral: false,
+    layoutSaveOk: true,
     uiMode: "windows",
   };
 
@@ -193,6 +194,7 @@
   }
 
   function scheduleSave() {
+    if (!state.layoutSaveOk) return;
     clearTimeout(state.saveTimer);
     state.saveTimer = setTimeout(saveLayout, 500);
   }
@@ -223,6 +225,7 @@
             mode: viewMode(v),
             camera: undefined,
             minimized: !!v.minimized,
+            windowDock: !!v.windowDock,
           };
         }
         return {
@@ -232,6 +235,7 @@
         mode: viewMode(v),
         camera: v.cosmos ? v.cosmos.getCamera() : v.camera,
         minimized: !!v.minimized,
+        windowDock: !!v.windowDock,
         };
       }),
       split: serializeSplit(state.split),
@@ -254,15 +258,31 @@
 
   async function saveLayout() {
     try {
+      if (!state.layoutSaveOk) return;
       if (state.ephemeral) await saveLooksMerge();
       else await api.put("/api/layout", collectLayout());
     } catch (_) {}
+    schedulePeekSlot();
   }
 
   async function flushSave() {
     clearTimeout(state.saveTimer);
     state.saveTimer = 0;
     await saveLayout();
+  }
+
+  function flushSaveKeepalive() {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = 0;
+    if (!state.layoutSaveOk || state.ephemeral) return;
+    try {
+      fetch("/api/layout", {
+        method: "PUT",
+        keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(collectLayout()),
+      });
+    } catch (_) {}
   }
 
   function splitAxisOf(node) {
@@ -412,8 +432,12 @@
             ? "Tile file windows in a grid"
             : "Stack file windows with an offset";
     });
-    const el = $("#btn-ui-mode");
-    if (el) el.textContent = state.uiMode === "stardust" ? "StarDust UI" : "Windows UI";
+    const brand = $("#brand");
+    if (brand) {
+      const label = state.uiMode === "stardust" ? "Switch to Windows UI" : "Switch to StarDust UI";
+      brand.title = label;
+      brand.setAttribute("aria-label", label);
+    }
   }
 
   function refreshEditMenu() {
@@ -588,6 +612,10 @@
       onDblClick(_e, star) {
         if (star) openStar(view, star);
         else if (view.cns) cnsLeaveNeighborhood(view);
+        else {
+          const up = parentPath(view.path);
+          if (up && up !== view.path) navigateView(view, up, true);
+        }
       },
       onWorldPointer(w, client) {
         state.lastWorld = w;
@@ -595,16 +623,7 @@
         state.lastViewId = view.id;
       },
       onStarDragEnd(star, e) {
-        if (view.cns) return;
-        const over = viewAtClient(e.clientX, e.clientY);
-        if (over && over.id !== view.id && star) {
-          const dest = joinPath(over.path, star.name);
-          const fn = e.shiftKey ? "move" : "copy";
-          mutate(fn, { from: star.path, to: dest }).then(() => {
-            loadChildren(view);
-            loadChildren(over);
-          });
-        }
+        return cosmosStarMove(view, star, e);
       },
       onDrop(e) {
         handleDrop(e, view);
@@ -619,6 +638,96 @@
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return v;
     }
     return null;
+  }
+
+  function forbiddenFsPath(p) {
+    return String(p || "")
+      .replace(/\//g, "\\")
+      .split("\\")
+      .some((c) => {
+        const n = c.toLowerCase();
+        return n === "appdata" || n === "application data" || n.startsWith("stardust-ws-");
+      });
+  }
+
+  function starDragSources(view, star) {
+    const sel = view.selection || [];
+    if (sel.some((s) => s && pathKey(s.path) === pathKey(star.path))) {
+      return sel.filter((s) => s && s.path);
+    }
+    return [star];
+  }
+
+  function folderStarAtClient(over, x, y, sources) {
+    const c = cosmosOf(over);
+    if (!c || !c.stars || !c.screenOf) return null;
+    const exclude = new Set((sources || []).map((s) => pathKey(s.path)));
+    let best = null;
+    let bestD = 1e9;
+    for (const s of c.stars() || []) {
+      if (!s || s.kind !== "dir" || exclude.has(pathKey(s.path))) continue;
+      const scr = c.screenOf(s);
+      if (!scr) continue;
+      const d = Math.hypot(scr.x - x, scr.y - y);
+      const rad = (scr.r || 16) + 14;
+      if (d < rad && d < bestD) {
+        best = s;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  function cosmosDropDest(over, x, y, sources) {
+    const c = cosmosOf(over);
+    const exclude = new Set((sources || []).map((s) => pathKey(s.path)));
+    const hit = c && c.starAtClient ? c.starAtClient(x, y) : null;
+    if (hit && !exclude.has(pathKey(hit.path))) {
+      if (hit.kind === "dir") return { kind: "folder", star: hit };
+      return { kind: "file" };
+    }
+    const folder = folderStarAtClient(over, x, y, sources);
+    if (folder) return { kind: "folder", star: folder };
+    return { kind: "empty" };
+  }
+
+  function cosmosStarMove(view, star, e) {
+    if (view.cns || !star || !star.path) return false;
+    const over = viewAtClient(e.clientX, e.clientY);
+    if (!over || over.cns) return false;
+    const sources = starDragSources(view, star);
+    const drop = cosmosDropDest(over, e.clientX, e.clientY, sources);
+    let destDir = null;
+    if (drop.kind === "folder") destDir = drop.star.path;
+    else if (drop.kind === "empty" && over.id !== view.id) destDir = over.path;
+    if (!destDir) return false;
+    const destK = pathKey(destDir);
+    const jobs = [];
+    for (const s of sources) {
+      if (forbiddenFsPath(s.path) || forbiddenFsPath(destDir)) {
+        toast("move refused: AppData / agent temp workspace");
+        return true;
+      }
+      const fromK = pathKey(s.path);
+      if (fromK === destK || destK.startsWith(fromK + "\\")) continue;
+      const to = joinPath(destDir, baseName(s.path));
+      if (pathKey(to) === fromK) continue;
+      if (forbiddenFsPath(to)) {
+        toast("move refused: AppData / agent temp workspace");
+        return true;
+      }
+      jobs.push({ from: s.path, to });
+    }
+    if (!jobs.length) return false;
+    (async () => {
+      for (const j of jobs) {
+        const ok = await mutate("move", j);
+        if (!ok) break;
+      }
+      await loadChildren(view);
+      if (over.id !== view.id) await loadChildren(over);
+    })();
+    return true;
   }
 
   async function ensureEngine(view) {
@@ -848,6 +957,7 @@
       mode: "2d",
       selection: [],
       minimized: false,
+      windowDock: false,
       pathHist: [path || root || state.meta.defaultRoot || ""],
       pathIdx: 0,
       itemCount: 0,
@@ -866,12 +976,17 @@
     const el = document.createElement("div");
     el.className = "cview";
     el.dataset.id = v.id;
+    if (v.windowDock) el.classList.add("window-dock");
     el.innerHTML =
       '<header class="vhead"><div class="crumbs"></div><div class="vbtns">' +
       '<button type="button" data-act="pin-temp" title="Minimize">–</button>' +
       '<button type="button" data-act="close" title="Close">×</button>' +
       '<button type="button" data-act="pin-perm" title="Pin">☆</button>' +
-      '<button type="button" data-act="split" title="New split (Ctrl+N)">⊞</button>' +
+      '<button type="button" data-act="split" title="New split (Ctrl+N)">' +
+      '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
+      '<rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/>' +
+      '<path d="M8 3v10" fill="none" stroke="currentColor" stroke-width="1.4"/>' +
+      "</svg></button>" +
       '</div></header><div class="vstage"><div class="vcosmos"></div>' +
       '<div class="cns-inspect" hidden></div>' +
       '<div class="vdock" hidden><div class="dtabs"></div><div class="dbody"></div></div>' +
@@ -1039,6 +1154,48 @@
     else state.split = replaceNode(state.split, leaf, neu);
     remount();
     return nv;
+  }
+
+  function dockView() {
+    return (state.views || []).find((v) => v && v.windowDock && !v.minimized) || null;
+  }
+
+  function cosmosPeekEl(view) {
+    return (view && view.rootEl && view.rootEl.querySelector(".vcosmos")) || null;
+  }
+
+  function cosmosPeekRect() {
+    const view = dockView() || focusedView();
+    if (!view) return null;
+    const el = cosmosPeekEl(view);
+    if (!el || typeof el.getBoundingClientRect !== "function") return null;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return null;
+    return {
+      x: Math.round((window.screenX || window.screenLeft || 0) + r.left),
+      y: Math.round((window.screenY || window.screenTop || 0) + r.top),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+    };
+  }
+
+  let peekSlotKey = "";
+  let peekSlotRaf = 0;
+  function postPeekSlot() {
+    const rect = cosmosPeekRect();
+    if (!rect) return;
+    const key = rect.x + "," + rect.y + "," + rect.w + "," + rect.h;
+    if (key === peekSlotKey) return;
+    peekSlotKey = key;
+    api.post("/api/drive", { op: "peek-slot", args: rect }).catch(() => {});
+  }
+
+  function schedulePeekSlot() {
+    if (peekSlotRaf) cancelAnimationFrame(peekSlotRaf);
+    peekSlotRaf = requestAnimationFrame(() => {
+      peekSlotRaf = 0;
+      postPeekSlot();
+    });
   }
 
   function splitFocused(view) {
@@ -1240,10 +1397,13 @@
         });
         let cnsOff = true;
         let cnsLabel = "Inspect in StarDust";
+        let cnsFn = () => inspectInStarDust(view, files[0].path);
         try {
           const st = await api.get("/api/cns/status");
           if (!st || !st.python) {
-            cnsLabel = "Inspect in StarDust — " + ((st && st.reason) || "needs --features python");
+            cnsOff = false;
+            cnsLabel = "Rebuild with Python to Inspect in StarDust";
+            cnsFn = () => runRebuildUi({ features: ["python"] });
           } else {
             const pr = await api.get("/api/cns/probe?path=" + encodeURIComponent(files[0].path));
             cnsOff = !pr || !pr.canInspect;
@@ -1258,7 +1418,7 @@
         items.push({
           label: cnsLabel,
           off: cnsOff,
-          fn: () => inspectInStarDust(view, files[0].path),
+          fn: cnsFn,
         });
       }
       const pinSpecs = group.map((s) => ({
@@ -2443,9 +2603,11 @@
   let resumeFromHostTimer = 0;
   function resumeFromHost() {
     if (!pageIsVisible()) return;
+    if (imeComposing || imeHoldsSearch()) return;
     if (resumeFromHostTimer) clearTimeout(resumeFromHostTimer);
     resumeFromHostTimer = setTimeout(() => {
       resumeFromHostTimer = 0;
+      if (imeComposing || imeHoldsSearch()) return;
       resumeAfterOcclusion();
     }, 40);
   }
@@ -2484,27 +2646,25 @@
         placeSearchDrop();
       }
     });
-    go.addEventListener("input", () => {
+    go.addEventListener("input", (e) => {
       focusView(view);
       searchAnchor = go;
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => doSearch(go.value.trim()), 200);
+      scheduleDoSearch(go.value.trim(), e);
     });
     go.addEventListener("keydown", (e) => {
       const drop = $("#search-drop");
-      const hits = drop ? $$(".search-hit", drop) : [];
+      const hits = drop ? $$(".search-hit", drop).filter((h) => h.dataset && h.dataset.hit) : [];
       const on = hits.findIndex((h) => h.classList.contains("active"));
       if (e.key === "ArrowDown") {
+        if (imeHoldsSearch(e)) return;
         e.preventDefault();
-        const n = hits[Math.min(hits.length - 1, on + 1)] || hits[0];
-        hits.forEach((h) => h.classList.remove("active"));
-        if (n) n.classList.add("active");
+        activateSearchHitRow(drop, hits[Math.min(hits.length - 1, on + 1)] || hits[0]);
       } else if (e.key === "ArrowUp") {
+        if (imeHoldsSearch(e)) return;
         e.preventDefault();
-        const n = hits[Math.max(0, on - 1)];
-        hits.forEach((h) => h.classList.remove("active"));
-        if (n) n.classList.add("active");
+        activateSearchHitRow(drop, hits[Math.max(0, on - 1)] || hits[0]);
       } else if (e.key === "Enter") {
+        if (imeHoldsSearch(e)) return;
         const hit = hits.find((h) => h.classList.contains("active")) || hits[0];
         if (!hit) return;
         e.preventDefault();
@@ -2518,6 +2678,7 @@
           dropEl.hidden = true;
           dropEl.innerHTML = "";
         }
+        clearSearchPreview();
         if (!had && cnsInNeighborhood(view)) {
           cnsLeaveNeighborhood(view);
           go.blur();
@@ -2699,7 +2860,20 @@
     location.replace(url.href);
   }
 
-  async function runRebuildUi() {
+  function rebuildCargoLine(features) {
+    if (features && features.length) {
+      return "cargo build -p fs-viz --features " + features.join(",");
+    }
+    return "cargo build -p fs-viz";
+  }
+
+  async function runRebuildUi(opts) {
+    const features =
+      opts && Array.isArray(opts.features) && opts.features.length ? opts.features.slice() : [];
+    const cargoLine = rebuildCargoLine(features);
+    const body = features.length ? { features } : {};
+    const waitText =
+      cargoLine + "\nthen target\\debug\\fs-viz.exe --desktop --replace\n\nBuilding…\n";
     const floats = $("#floats");
     const el = document.createElement("div");
     el.className = "float-win focused";
@@ -2708,8 +2882,10 @@
     el.style.width = "640px";
     el.style.height = "360px";
     el.innerHTML =
-      '<div class="float-title"><span class="t">Rebuild StarDust UI</span><button type="button" data-act="pin" title="Pin">☆</button><button type="button" data-act="x">×</button></div>' +
-      '<div class="float-body"><pre class="test-out">cargo build -p fs-viz\nthen target\\debug\\fs-viz.exe --desktop --replace\n\nBuilding…\n</pre></div><div class="float-resize"></div>';
+      '<div class="float-title"><span class="t"></span><button type="button" data-act="pin" title="Pin">☆</button><button type="button" data-act="x">×</button></div>' +
+      '<div class="float-body"><pre class="test-out"></pre></div><div class="float-resize"></div>';
+    el.querySelector(".t").textContent = cargoLine;
+    el.querySelector(".test-out").textContent = waitText;
     floats.appendChild(el);
     const out = el.querySelector(".test-out");
     el.querySelector('[data-act="x"]').onclick = () => el.remove();
@@ -2730,7 +2906,8 @@
       secs += 1;
       if (out && !out.dataset.done) {
         out.textContent =
-          "cargo build -p fs-viz\nthen target\\debug\\fs-viz.exe --desktop --replace\n\nBuilding… " +
+          cargoLine +
+          "\nthen target\\debug\\fs-viz.exe --desktop --replace\n\nBuilding… " +
           secs +
           "s\n";
       }
@@ -2739,7 +2916,7 @@
       try {
         await flushSave();
       } catch (_) {}
-      const data = await api.post("/api/rebuild-ui", {});
+      const data = await api.post("/api/rebuild-ui", body);
       out.dataset.done = "1";
       out.textContent =
         (data && (data.output || data.stdout || data.raw)) || JSON.stringify(data, null, 2);
@@ -2758,58 +2935,6 @@
     } catch (e) {
       toast(errText(e));
     }
-  }
-
-  async function openFolder(view) {
-    const v = view || focusedView();
-    let pickedName = "";
-    if (window.showDirectoryPicker) {
-      try {
-        const handle = await window.showDirectoryPicker();
-        pickedName = (handle && handle.name) || "";
-      } catch (e) {
-        if (e && e.name === "AbortError") return;
-      }
-    }
-    const start = (v && v.root) || state.meta.defaultRoot || "";
-    let prefill = start;
-    if (pickedName && start) {
-      const parent = parentPath(start);
-      if (parent) prefill = joinPath(parent, pickedName);
-    }
-    $("#modal-title").textContent = "Open folder";
-    $("#modal-body").innerHTML =
-      (pickedName ? "<p>Picked folder name: <code>" + pickedName.replace(/</g, "") + "</code>. Browsers do not expose the real path — enter the absolute path.</p>" : "<p>Enter an absolute folder path.</p>") +
-      '<input id="folder-path"/>';
-    $("#modal-actions").innerHTML = "";
-    const cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.textContent = "Cancel";
-    const ok = document.createElement("button");
-    ok.type = "button";
-    ok.className = "primary";
-    ok.textContent = "Open";
-    $("#modal-actions").append(cancel, ok);
-    $("#modal").hidden = false;
-    const inp = $("#folder-path");
-    inp.value = prefill;
-    inp.focus();
-    inp.select();
-    return new Promise((resolve) => {
-      cancel.onclick = () => {
-        $("#modal").hidden = true;
-        resolve(null);
-      };
-      ok.onclick = () => {
-        const p = inp.value.trim();
-        $("#modal").hidden = true;
-        if (p && v) {
-          v.root = p;
-          navigateView(v, p, true);
-        }
-        resolve(p);
-      };
-    });
   }
 
   function arrangeAll(key) {
@@ -2850,6 +2975,7 @@
       if (v.cosmos2) v.cosmos2.resize();
       if (v.cosmos3) v.cosmos3.resize();
     });
+    schedulePeekSlot();
   }
 
   function bindMenus() {
@@ -2872,7 +2998,7 @@
       });
     });
     document.addEventListener("click", (e) => {
-      const cmdBtn = e.target.closest(".menu-pop button[data-cmd]");
+      const cmdBtn = e.target.closest(".menu-pop button[data-cmd], #brand[data-cmd]");
       if (cmdBtn && cmdBtn.dataset.cmd) {
         hidePop();
         runCmd(cmdBtn.dataset.cmd);
@@ -2889,15 +3015,6 @@
     const v = focusedView();
     const sel = selection();
     switch (cmd) {
-      case "open-folder":
-        openFolder(v);
-        break;
-      case "open-desktop":
-        if (state.meta.desktopPath) navigateView(v, state.meta.desktopPath, true);
-        break;
-      case "open-this-pc":
-        navigateView(v, THIS_PC, true);
-        break;
       case "ui-stardust":
         setUiMode("stardust");
         break;
@@ -2940,13 +3057,6 @@
       case "galaxy":
         arrangeAll("galaxy");
         break;
-      case "about":
-        modal({
-          title: "About StarDust",
-          html: "<p>StarDust cosmos is a daily-dev shell over the host file tree. Directories and files are stars; dumpable IR is the source of truth for Inspect, and <code>.sd</code> is a copy.</p>",
-          buttons: [{ label: "OK", primary: true, value: true }],
-        });
-        break;
       case "toggle-mode":
         setMode(viewMode(v) === "2d" ? "3d" : "2d", v);
         break;
@@ -2958,6 +3068,18 @@
         break;
       case "rebuild-ui":
         runRebuildUi();
+        break;
+      case "rebuild-ui-python":
+        runRebuildUi({ features: ["python"] });
+        break;
+      case "rebuild-ui-llvm":
+        runRebuildUi({ features: ["llvm"] });
+        break;
+      case "rebuild-ui-haskell":
+        runRebuildUi({ features: ["haskell"] });
+        break;
+      case "rebuild-ui-lean":
+        runRebuildUi({ features: ["lean"] });
         break;
       case "open-cursor":
         openInCursor();
@@ -2992,6 +3114,153 @@
   let searchTimer = null;
   let searchSeq = 0;
   let searchAnchor = null;
+  let searchAbort = null;
+  let searchPaintQueued = false;
+  let imeComposing = false;
+  let imeSession = false;
+  let imeQuietTimer = 0;
+  let imePosted = null;
+  let imeWantsSearch = false;
+
+  function isSearchField(el) {
+    return !!(
+      el &&
+      (el.id === "search-input" || (el.classList && el.classList.contains("cns-find")))
+    );
+  }
+
+  function postIme(composing) {
+    if (imePosted === composing) return;
+    imePosted = composing;
+    try {
+      fetch("/api/ime", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ composing: composing }),
+        keepalive: true,
+      }).catch(function () {});
+    } catch (_) {}
+  }
+
+  function enterIme(target) {
+    if (isSearchField(target) || isSearchField(document.activeElement)) {
+      imeWantsSearch = true;
+    }
+    imeComposing = true;
+    if (imeQuietTimer) {
+      clearTimeout(imeQuietTimer);
+      imeQuietTimer = 0;
+    }
+    postIme(true);
+  }
+
+  function relatedTargetLooksLikeIme(el) {
+    if (el == null) return true;
+    const blob = (String(el.id || "") + " " + String(el.className || "")).toLowerCase();
+    return /weasel|msctf|cicero|candidate|weaselime|ime-/.test(blob) || blob.trim() === "ime";
+  }
+
+  function leaveImeHold() {
+    if (imeQuietTimer) {
+      clearTimeout(imeQuietTimer);
+      imeQuietTimer = 0;
+    }
+    imeComposing = false;
+    imeSession = false;
+    imeWantsSearch = false;
+    postIme(false);
+  }
+
+  function beginImeQuiet() {
+    imeComposing = true;
+    postIme(true);
+    if (imeQuietTimer) clearTimeout(imeQuietTimer);
+    imeQuietTimer = setTimeout(function () {
+      imeQuietTimer = 0;
+      imeComposing = false;
+      postIme(false);
+      if (imeWantsSearch) {
+        imeWantsSearch = false;
+        const el = searchAnchor || $("#search-input");
+        if (el) doSearch(el.value.trim());
+      }
+    }, 700);
+  }
+
+  function imeHoldsSearch(e) {
+    return !!(imeComposing || (e && (e.isComposing || e.keyCode === 229)));
+  }
+
+  function scheduleDoSearch(q, e) {
+    if (imeHoldsSearch(e)) {
+      clearTimeout(searchTimer);
+      return;
+    }
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function () {
+      doSearch(q);
+    }, 200);
+  }
+
+  function bindIme() {
+    document.addEventListener(
+      "compositionstart",
+      function (e) {
+        imeSession = true;
+        enterIme(e.target);
+      },
+      true
+    );
+    document.addEventListener(
+      "compositionupdate",
+      function (e) {
+        imeSession = true;
+        enterIme(e.target);
+      },
+      true
+    );
+    document.addEventListener(
+      "compositionend",
+      function (e) {
+        imeSession = false;
+        if (isSearchField(e.target) || isSearchField(document.activeElement)) {
+          imeWantsSearch = true;
+        }
+        beginImeQuiet();
+      },
+      true
+    );
+    document.addEventListener(
+      "keydown",
+      function (e) {
+        const search = isSearchField(e.target) || isSearchField(document.activeElement);
+        if (search) {
+          if (e.keyCode === 229 || e.isComposing) {
+            enterIme(e.target);
+            return;
+          }
+          if (imeQuietTimer) return;
+          if (imeComposing) leaveImeHold();
+          return;
+        }
+        if (e.keyCode === 229 || e.isComposing) {
+          enterIme(e.target);
+          if (!imeSession) beginImeQuiet();
+        }
+      },
+      true
+    );
+    document.addEventListener(
+      "focusout",
+      function (e) {
+        if (!isSearchField(e.target)) return;
+        if (isSearchField(e.relatedTarget)) return;
+        if (relatedTargetLooksLikeIme(e.relatedTarget)) return;
+        leaveImeHold();
+      },
+      true
+    );
+  }
   function syncSearchPlaceholder() {
     const inp = $("#search-input");
     if (!inp) return;
@@ -3027,29 +3296,30 @@
         placeSearchDrop();
       }
     });
-    inp.addEventListener("input", () => {
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => doSearch(inp.value.trim()), 200);
+    inp.addEventListener("input", (e) => {
+      scheduleDoSearch(inp.value.trim(), e);
     });
     inp.addEventListener("keydown", (e) => {
-      const hits = $$(".search-hit", drop);
+      const hits = $$(".search-hit", drop).filter((h) => h.dataset && h.dataset.hit);
       const on = hits.findIndex((h) => h.classList.contains("active"));
       if (e.key === "ArrowDown") {
+        if (imeHoldsSearch(e)) return;
         e.preventDefault();
-        const n = hits[Math.min(hits.length - 1, on + 1)] || hits[0];
-        hits.forEach((h) => h.classList.remove("active"));
-        if (n) n.classList.add("active");
+        activateSearchHitRow(drop, hits[Math.min(hits.length - 1, on + 1)] || hits[0]);
       } else if (e.key === "ArrowUp") {
+        if (imeHoldsSearch(e)) return;
         e.preventDefault();
-        const n = hits[Math.max(0, on - 1)];
-        hits.forEach((h) => h.classList.remove("active"));
-        if (n) n.classList.add("active");
+        activateSearchHitRow(drop, hits[Math.max(0, on - 1)] || hits[0]);
       } else if (e.key === "Enter") {
+        if (imeHoldsSearch(e)) return;
         const hit = hits.find((h) => h.classList.contains("active")) || hits[0];
         if (!hit) return;
         e.preventDefault();
         activateHit(JSON.parse(hit.dataset.hit), e.altKey);
-      } else if (e.key === "Escape") drop.hidden = true;
+      } else if (e.key === "Escape") {
+        drop.hidden = true;
+        clearSearchPreview();
+      }
     });
   }
 
@@ -3079,11 +3349,19 @@
   async function doSearch(q) {
     const drop = $("#search-drop");
     const seq = ++searchSeq;
+    if (searchAbort) {
+      try {
+        searchAbort.abort();
+      } catch (_) {}
+      searchAbort = null;
+    }
     if (!q) {
       drop.hidden = true;
       drop.innerHTML = "";
+      clearSearchPreview();
       return;
     }
+    clearSearchPreview();
     drop.hidden = false;
     drop.innerHTML = '<div class="search-hit muted">Searching…</div>';
     placeSearchDrop();
@@ -3125,28 +3403,43 @@
     let hits = [];
     try {
       const seen = new Set();
+      if (searchAbort) {
+        try {
+          searchAbort.abort();
+        } catch (_) {}
+      }
+      searchAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const signal = searchAbort && searchAbort.signal;
+      function addHit(h) {
+        const k = pathKey(h && h.path);
+        if (!k || seen.has(k)) return;
+        seen.add(k);
+        hits.push(h);
+      }
+      function paintPartial() {
+        if (seq !== searchSeq) return;
+        queueSearchPaint(drop, hits, q, true);
+      }
       for (let i = 0; i < roots.length; i++) {
         if (seq !== searchSeq) return;
         const root = roots[i];
-        let list = [];
+        let streamed = false;
         try {
-          const data = await api.get(
-            "/api/search?root=" + encodeURIComponent(root) + "&q=" + encodeURIComponent(q)
-          );
-          list = Array.isArray(data) ? data : (data && (data.hits || data.results)) || [];
-        } catch (_) {
-          continue;
+          streamed = await searchRootStream(root, q, seq, addHit, paintPartial, signal);
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+          streamed = false;
         }
-        list.forEach((h) => {
-          const k = pathKey(h.path || "");
-          if (!k || seen.has(k)) return;
-          seen.add(k);
-          hits.push(h);
-        });
-        if (i === 0) {
-          paintSearchHits(drop, hits, q, true);
-          placeSearchDrop();
+        if (!streamed) {
+          try {
+            const data = await api.get(
+              "/api/search?root=" + encodeURIComponent(root) + "&q=" + encodeURIComponent(q)
+            );
+            const list = Array.isArray(data) ? data : (data && (data.hits || data.results)) || [];
+            list.forEach(addHit);
+          } catch (_) {}
         }
+        paintPartial();
       }
       if (!roots.length) throw new Error("no roots");
     } catch (_) {
@@ -3161,6 +3454,144 @@
     if (seq !== searchSeq) return;
     paintSearchHits(drop, hits, q, false);
     placeSearchDrop();
+  }
+
+  function clearSearchPreview() {
+    (state.views || []).forEach((v) => {
+      const c = cosmosOf(v);
+      if (c && c.previewSelection) c.previewSelection([]);
+    });
+  }
+
+  function deepestVisibleAncestor(stars, hitPath) {
+    const hitK = pathKey(hitPath);
+    let best = null;
+    let bestLen = -1;
+    for (const s of stars || []) {
+      if (!s || s.kind !== "dir" || !s.path) continue;
+      const sk = pathKey(s.path);
+      if (sk && (hitK === sk || hitK.startsWith(sk + "\\"))) {
+        if (sk.length > bestLen) {
+          best = s;
+          bestLen = sk.length;
+        }
+      }
+    }
+    return best;
+  }
+
+  function previewSearchHit(hit) {
+    if (!hit || !hit.path) {
+      clearSearchPreview();
+      return;
+    }
+    const hitPath = hit.path;
+    (state.views || []).forEach((v) => {
+      const c = cosmosOf(v);
+      if (!c || !c.previewSelection) return;
+      if (v.cns) {
+        c.previewSelection([]);
+        return;
+      }
+      const stars = c.stars ? c.stars() : [];
+      const exact = stars.find((s) => pathKey(s.path) === pathKey(hitPath));
+      if (exact) {
+        c.previewSelection([exact.name]);
+        return;
+      }
+      const anc = deepestVisibleAncestor(stars, hitPath);
+      c.previewSelection(anc ? [anc.name] : []);
+    });
+  }
+
+  function activateSearchHitRow(drop, btn) {
+    if (drop) {
+      $$(".search-hit", drop).forEach((h) => h.classList.remove("active"));
+    }
+    if (btn && btn.dataset && btn.dataset.hit) {
+      btn.classList.add("active");
+      try {
+        previewSearchHit(JSON.parse(btn.dataset.hit));
+      } catch (_) {
+        clearSearchPreview();
+      }
+    } else {
+      clearSearchPreview();
+    }
+  }
+
+  function queueSearchPaint(drop, hits, q, partial) {
+    if (searchPaintQueued) {
+      searchPaintQueued.drop = drop;
+      searchPaintQueued.hits = hits;
+      searchPaintQueued.q = q;
+      searchPaintQueued.partial = partial;
+      return;
+    }
+    searchPaintQueued = { drop, hits, q, partial };
+    requestAnimationFrame(() => {
+      const job = searchPaintQueued;
+      searchPaintQueued = false;
+      if (!job || !job.drop) return;
+      paintSearchHits(job.drop, job.hits, job.q, job.partial);
+      placeSearchDrop();
+    });
+  }
+
+  async function readSearchNdjson(res, seq, onHit, onPaint) {
+    if (!res || !res.body || !res.body.getReader) return false;
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const step = await reader.read();
+      if (seq !== searchSeq) {
+        try {
+          reader.cancel();
+        } catch (_) {}
+        return true;
+      }
+      if (step.done) break;
+      buf += dec.decode(step.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch (_) {
+          continue;
+        }
+        if (obj.error) throw new Error(typeof obj.error === "string" ? obj.error : "search failed");
+        if (obj.hit) {
+          onHit(obj.hit);
+          if (onPaint) onPaint();
+        }
+      }
+    }
+    return true;
+  }
+
+  async function searchRootStream(root, q, seq, onHit, onPaint, signal) {
+    const url =
+      "/api/search?root=" +
+      encodeURIComponent(root) +
+      "&q=" +
+      encodeURIComponent(q) +
+      "&stream=1";
+    const res = await fetch(url, signal ? { signal } : {});
+    if (!res.ok) return false;
+    const ctype = (res.headers.get("content-type") || "").toLowerCase();
+    if (ctype.indexOf("ndjson") >= 0) {
+      return readSearchNdjson(res, seq, onHit, onPaint);
+    }
+    const data = await res.json();
+    const list = (data && data.hits) || [];
+    list.forEach(onHit);
+    if (onPaint) onPaint();
+    return true;
   }
 
   function paintSearchHits(drop, hits, q, partial) {
@@ -3190,13 +3621,7 @@
             : h.path || ""
         ).replace(/</g, "") +
         "</div>";
-      b.onmouseenter = () => {
-        const fv = focusedView();
-        const c = cosmosOf(fv);
-        if (!c) return;
-        if (fv.path === parent) c.highlight(h.name || baseName(h.path));
-        else if (c.highlightParent) c.highlightParent(parent);
-      };
+      b.onmouseenter = () => activateSearchHitRow(drop, b);
       b.onclick = (ev) => activateHit(Object.assign({}, h, { parent }), ev.altKey);
       drop.appendChild(b);
     });
@@ -3214,6 +3639,12 @@
     const drop = $("#search-drop");
     searchSeq += 1;
     clearTimeout(searchTimer);
+    if (searchAbort) {
+      try {
+        searchAbort.abort();
+      } catch (_) {}
+      searchAbort = null;
+    }
     if (inp) inp.value = "";
     $$(".cns-find").forEach((el) => {
       el.value = "";
@@ -3223,6 +3654,7 @@
       drop.innerHTML = "";
       drop.hidden = true;
     }
+    clearSearchPreview();
   }
 
   async function activateHit(h, jump) {
@@ -3450,16 +3882,6 @@
           focusPathField(focusedView());
           return;
         }
-        if (mod && !e.altKey && !e.shiftKey && letterKey(e, "o", "KeyO")) {
-          eatKey(e);
-          if (cosmosOk) runCmd("open-folder");
-          return;
-        }
-        if (mod && !e.altKey && !e.shiftKey && letterKey(e, "d", "KeyD")) {
-          eatKey(e);
-          if (cosmosOk) runCmd("open-desktop");
-          return;
-        }
         if (mod && !e.altKey && !e.shiftKey && letterKey(e, "n", "KeyN")) {
           eatKey(e);
           if (cosmosOk) runCmd("new-split");
@@ -3473,11 +3895,6 @@
         if (mod && e.shiftKey && !e.altKey && letterKey(e, "n", "KeyN")) {
           eatKey(e);
           if (cosmosOk) runCmd("new-folder");
-          return;
-        }
-        if (mod && e.shiftKey && !e.altKey && letterKey(e, "p", "KeyP")) {
-          eatKey(e);
-          if (cosmosOk) runCmd("open-this-pc");
           return;
         }
         if (mod && e.shiftKey && !e.altKey && e.code === "Digit2") {
@@ -3507,14 +3924,14 @@
           e.key &&
           e.key.length === 1
         ) {
+          if (imeHoldsSearch(e)) return;
           const find = vType.rootEl && vType.rootEl.querySelector(".cns-find");
           if (find) {
             eatKey(e);
             searchAnchor = find;
             find.focus();
             find.value = (find.value || "") + e.key;
-            clearTimeout(searchTimer);
-            searchTimer = setTimeout(() => doSearch(find.value.trim()), 200);
+            scheduleDoSearch(find.value.trim(), e);
             return;
           }
         }
@@ -3641,10 +4058,25 @@
     text.textContent = bits.join(" · ");
   }
 
+  function applyUiModeFromMeta(meta) {
+    if (!meta || uiModeBusy) return;
+    const next = meta.uiMode === "stardust" ? "stardust" : "windows";
+    if (next === state.uiMode) return;
+    state.uiMode = next;
+    refreshViewMenu();
+    refreshModeButton();
+    applyShellClass();
+  }
+
   async function refreshHealth() {
     try {
       const h = await api.get("/api/ui-health");
       state.meta.health = h;
+    } catch (_) {}
+    try {
+      const meta = await api.get("/api/meta");
+      Object.assign(state.meta, meta || {});
+      applyUiModeFromMeta(state.meta);
     } catch (_) {}
     try {
       const d = await api.get("/api/drives");
@@ -3687,6 +4119,7 @@
         navigateView(v, state.meta.desktopPath, true);
       }
       applyShellClass();
+      if (next === "stardust") schedulePeekSlot();
     } catch (e) {
       state.uiMode = prev;
       refreshViewMenu();
@@ -3703,11 +4136,15 @@
     applyShellClass();
     bindMenus();
     bindSearch();
+    bindIme();
     bindKeys();
     window.addEventListener("resize", resizeViews);
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") resumeFromHost();
+      else flushSave();
     });
+    window.addEventListener("pagehide", flushSaveKeepalive);
+    window.addEventListener("beforeunload", flushSaveKeepalive);
     window.addEventListener("pageshow", resumeFromHost);
     window.addEventListener("focus", resumeFromHost);
     document.addEventListener("dragover", (e) => e.preventDefault());
@@ -3724,7 +4161,14 @@
     let saved = {};
     try {
       saved = unwrapLayout(await api.get("/api/layout"));
-    } catch (_) {}
+    } catch (_) {
+      try {
+        saved = unwrapLayout(await api.get("/api/layout"));
+      } catch (_) {
+        saved = {};
+      }
+    }
+    if (!saved || typeof saved !== "object") saved = {};
 
     state.mode = saved.mode === "3d" ? "3d" : "2d";
     state.agentOpen = saved.agentOpen !== false;
@@ -3782,6 +4226,7 @@
     const openQ = q.get("open");
     const deskQ = q.get("desktop") === "1";
     state.ephemeral = !!openQ && !deskQ;
+    if (!state.ephemeral) state.layoutSaveOk = true;
     applyShellClass();
     const root =
       state.uiMode === "stardust" ? sessionRoot() || state.meta.defaultRoot || "" : state.meta.defaultRoot || "";
@@ -3793,6 +4238,7 @@
         const v = makeView(sv.root || root, sv.path || sv.root || root, sv.camera);
         v.id = sv.id || v.id;
         v.minimized = !!sv.minimized;
+        v.windowDock = !!sv.windowDock;
         v.mode = sv.mode === "3d" || (!sv.mode && saved.mode === "3d") ? "3d" : "2d";
       });
       state.split = saved.split || { type: "leaf", viewId: state.views[0].id };
@@ -3830,6 +4276,7 @@
       state.split = { type: "leaf", viewId: live.id };
     }
     remount();
+    if (state.uiMode === "stardust") schedulePeekSlot();
     refreshViewMenu();
     paintStatus();
     setInterval(() => {
@@ -3921,16 +4368,46 @@
     return { ok: true, path: view.path === THIS_PC ? "This PC" : view.path };
   }
 
+  function isAbsHostPath(p) {
+    const s = String(p || "");
+    return /^[A-Za-z]:[\\/]/.test(s) || s.startsWith("\\\\");
+  }
+
   async function uiOpen(names, paths) {
+    const pathList = Array.isArray(paths) ? paths.map(String) : [];
+    const launched = [];
+    const restPaths = [];
+    for (let i = 0; i < pathList.length; i++) {
+      const n = uiNormalizePath(pathList[i]);
+      if (!n || n === THIS_PC) continue;
+      if (isAbsHostPath(n)) {
+        try {
+          const st = await api.get("/api/exists?path=" + encodeURIComponent(n));
+          if (st && st.exists && st.kind === "file") {
+            await api.post("/api/open-external", { path: n });
+            launched.push(n);
+            continue;
+          }
+        } catch (e) {
+          return { ok: false, error: errText(e) };
+        }
+      }
+      restPaths.push(n);
+    }
+    const nameList = Array.isArray(names) ? names : [];
+    if (!nameList.length && !restPaths.length) {
+      if (!launched.length) return { ok: false, error: "no matching stars in the focused cosmos" };
+      return { ok: true, names: launched.map(baseName), paths: launched };
+    }
     const view = focusedView();
     if (!view) return { ok: false, error: "no focused cosmos" };
-    const stars = uiResolveStars(view, names, paths);
-    if (!stars.length) return { ok: false, error: "no matching stars in the focused cosmos" };
-    await openStars(view, stars);
+    const stars = uiResolveStars(view, nameList, restPaths);
+    if (!stars.length && !launched.length) return { ok: false, error: "no matching stars in the focused cosmos" };
+    if (stars.length) await openStars(view, stars);
     return {
       ok: true,
-      names: stars.map((s) => s.name),
-      paths: stars.map((s) => s.path),
+      names: launched.map(baseName).concat(stars.map((s) => s.name)),
+      paths: launched.concat(stars.map((s) => s.path)),
     };
   }
 
@@ -4009,6 +4486,70 @@
     };
   }
 
+  async function uiSearch(q) {
+    const query = String(q || "").trim();
+    if (!query) return { ok: false, error: "q is required" };
+    const roots = searchRootList();
+    const seen = new Set();
+    const hits = [];
+    for (let i = 0; i < roots.length; i++) {
+      try {
+        const data = await api.get(
+          "/api/search?root=" + encodeURIComponent(roots[i]) + "&q=" + encodeURIComponent(query)
+        );
+        const list = Array.isArray(data) ? data : (data && (data.hits || data.results)) || [];
+        list.forEach((h) => {
+          const k = pathKey(h.path || "");
+          if (!k || seen.has(k)) return;
+          seen.add(k);
+          hits.push({
+            name: h.name || baseName(h.path),
+            path: h.path,
+            kind: h.kind || "file",
+            parent: h.parent || parentPath(h.path),
+          });
+        });
+      } catch (_) {}
+    }
+    return { ok: true, q: query, hits: hits.slice(0, 40) };
+  }
+
+  async function uiJump(args) {
+    args = args || {};
+    const view = focusedView();
+    if (!view) return { ok: false, error: "no focused cosmos" };
+    let dest = uiNormalizePath(args.path || "");
+    if (!dest && args.name) {
+      const stars = uiResolveStars(view, [args.name], []);
+      if (stars[0] && stars[0].path) dest = stars[0].path;
+    }
+    if (!dest) return { ok: false, error: "path or name is required" };
+    if (dest === THIS_PC || /^this pc$/i.test(String(args.path || ""))) {
+      await navigateView(view, THIS_PC, true);
+      return { ok: true, path: "This PC", kind: "dir" };
+    }
+    let kind = String(args.kind || "");
+    if (!kind) {
+      try {
+        const st = await api.get("/api/stat?path=" + encodeURIComponent(dest));
+        kind = (st && st.kind) || "file";
+      } catch (e) {
+        return { ok: false, error: errText(e) };
+      }
+    }
+    if (kind === "dir" || kind === "directory") {
+      await navigateView(view, dest, true);
+      return { ok: true, path: view.path === THIS_PC ? "This PC" : view.path, kind: "dir" };
+    }
+    const folder = parentPath(dest);
+    if (!folder) return { ok: false, error: "no parent folder" };
+    await navigateView(view, folder, true);
+    const name = baseName(dest);
+    const c = cosmosOf(view);
+    if (c && typeof c.selectNames === "function") c.selectNames([name]);
+    return { ok: true, path: folder, name, kind: "file" };
+  }
+
   async function runUiCommand(cmd) {
     const id = cmd && cmd.id;
     const op = cmd && cmd.op;
@@ -4022,6 +4563,8 @@
       else if (op === "select") out = uiSelect(args.names);
       else if (op === "pin") out = uiPin(args.names, args.paths);
       else if (op === "copy") out = await uiCopy(args);
+      else if (op === "search") out = await uiSearch(args.q || args.query);
+      else if (op === "jump") out = await uiJump(args);
       else out = { ok: false, error: "unknown op" };
       return Object.assign(base, out);
     } catch (e) {
@@ -4059,6 +4602,8 @@
     select: (names) => uiSelect(names),
     pin: (names, paths) => uiPin(names, paths),
     copy: (args) => uiCopy(args),
+    search: (q) => uiSearch(q),
+    jump: (args) => uiJump(args),
     lookAtView,
   };
 })();

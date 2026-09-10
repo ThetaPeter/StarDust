@@ -22,9 +22,28 @@ const ATTACH_INLINE_MAX = 256 * 1024;
 const UI_CMD_TIMEOUT_MS = 10000;
 const DRIVE_TIMEOUT_MS = 20000;
 const DRIVE_RUN_TIMEOUT_MS = 45000;
+const SEARCH_TIMEOUT_MS = 5000;
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
-const UI_HINT =
-  "You cannot see the StarDust cosmos or folder view until you call look-at-view. That tool returns a screenshot of the focused cosmos pane only (not menus, not the Agent panel). Drive the live StarDust cosmos with navigate, open, select, pin, and copy. To see or operate other OS apps (browser, messenger, editor), use list-windows, target-window, look-at-window / look-at-workarea / look-at-desktop, window-click, window-type, drop-file, and run-ui. Those tools never move the user's real mouse; they drive a chosen window. Prefer one run-ui call for a short sequence instead of one click per turn. Do not use Shell for UI automation (no Add-Type, mouse_event, SendKeys, CopyFromScreen, HWND_TOPMOST, or screenshot files on Desktop). Never write under AppData or stardust-ws-*. Do not assume which folder is on screen from this message. The agent working directory is a temporary junction overlay (stardust-ws-* under the OS temp folder) of split roots — it is not the user's Desktop or the focused cosmos folder. Do not Write, Shell-copy, or save onto that cwd floor. When the user says \"copy this file\", call the copy tool with absolute host paths from look-at-view or @-attachments (not SDK Write). If dest is omitted, duplicate beside the source on the real host folder. If the user is clearly on Desktop with the file attached or selected, omit dest so it duplicates on Desktop. If the destination folder is unclear, ask. Never copy into stardust-ws-*.";
+const APPDATA_LOCK =
+  "Never move, rename, copy-away, relocate, or amend Windows AppData (Roaming, Local, or LocalLow), including %APPDATA%\\StarDust. Do not Write, Shell, copy, or delete under those trees.";
+const UI_HINT = [
+  "You cannot see the StarDust cosmos or folder view until you call look-at-view. That tool returns a screenshot of the focused cosmos pane only (not menus, not the Agent panel).",
+  "Drive the live StarDust cosmos with navigate, open, select, pin, copy, search, jump, exists, mkdir, and write-out.",
+  "exists { path } checks an absolute host path without changing the focused pane. Do not use Test-Path or Shell. Missing is exists:false. Refuse AppData / stardust-ws-*.",
+  "mkdir { path } creates one directory; the parent must already exist. No recursive create. Refuse AppData / stardust-ws-*. If the parent is missing or the path is ambiguous, ask.",
+  "search uses host HTTP (same ranking as the search bar), a few-second timeout, and empty/No matches on miss. It does not change the focused pane. One query per call. Never Test-Path.",
+  "open of a star name in the focused cosmos is unchanged. An absolute existing file or .lnk launches even if it is not a star; the cosmos folder stays. An absolute directory is jump, not Explorer.",
+  "jump opens a folder in the focused pane, or for a file goes to its parent and selects it — do not open a Windows viewer to ingest a file.",
+  "write-out saves generated payloads in %USERPROFILE%\\.stardust-out (not the agent cwd).",
+  "To see or operate other OS apps (browser, messenger, editor), use list-windows, target-window, look-at-window / look-at-workarea / look-at-desktop, window-click, window-type, drop-file, and run-ui.",
+  "Call list-windows first before launching Chrome (or any app) if a usable HWND may already exist. list-windows includes processName and, when the title has a browser suffix, an optional url from that leftover prefix. URL only from the visible title or look-at-window hits — never AppData, History, or session files.",
+  "look-at-window stays outside run-ui. Prefer one run-ui call for a short click/type sequence instead of one click per turn.",
+  "Those tools never move the user's real mouse; they drive a chosen window. Driven apps go into the reserved cosmos window-dock split and stay visible; dragging the OS window off that slot undocks it. Do not Shell-minimize or hide between looks.",
+  `Do not use Shell for UI automation (no Add-Type, mouse_event, SendKeys, CopyFromScreen, HWND_TOPMOST, or screenshot files on Desktop). ${APPDATA_LOCK} Never write under stardust-ws-*.`,
+  "Do not assume which folder is on screen from this message. If a path is ambiguous, ask.",
+  "The agent working directory is a temporary junction overlay (stardust-ws-* under the OS temp folder) of split roots — it is not the user's Desktop or the focused cosmos folder. Do not Write, Shell-copy, or save onto that cwd floor.",
+  "When the user says \"copy this file\", call the copy tool with absolute host paths from look-at-view or @-attachments (not SDK Write). If dest is omitted, duplicate beside the source on the real host folder. If the user is clearly on Desktop with the file attached or selected, omit dest so it duplicates on Desktop. If the destination folder is unclear, ask. Never copy into stardust-ws-*.",
+].join(" ");
 
 function scriptMtimeSecs() {
   try {
@@ -170,6 +189,19 @@ function stillTempWorkspacePath(p) {
   const sl = s.toLowerCase();
   const cl = cwd.toLowerCase();
   return sl === cl || sl.startsWith(cl + "/");
+}
+
+function isForbiddenHostPath(p) {
+  const s = slash(p);
+  if (/(?:^|\/)stardust-ws-[^/]*/i.test(s)) return true;
+  if (/(?:^|\/)AppData(?:\/|$)/i.test(s)) return true;
+  if (/(?:^|\/)Application Data(?:\/|$)/i.test(s)) return true;
+  return stillTempWorkspacePath(p);
+}
+
+function isAbsHostPath(p) {
+  const s = String(p || "");
+  return /^[A-Za-z]:[\\/]/.test(s) || s.startsWith("\\\\") || s.startsWith("//");
 }
 
 function mapArgPaths(args) {
@@ -361,7 +393,7 @@ function uiCustomTools() {
     },
     open: {
       description:
-        "Open stars in the focused StarDust cosmos (folders navigate; files open in the editor). Pass star names from look-at-view, or absolute paths.",
+        "Open stars in the focused StarDust cosmos (folders navigate; files open in the editor). Star names from look-at-view are unchanged. An absolute existing file or .lnk launches even if it is not a star; the cosmos folder stays. An absolute directory is jump, not Explorer. Never AppData / stardust-ws-*.",
       inputSchema: {
         type: "object",
         properties: {
@@ -373,14 +405,59 @@ function uiCustomTools() {
           paths: {
             type: "array",
             items: { type: "string" },
-            description: "Absolute star paths",
+            description: "Absolute host paths, or star paths in the focused cosmos",
           },
         },
         additionalProperties: false,
       },
       annotations: { title: "open", openWorldHint: true },
       async execute(args) {
-        return uiOkText(await runUiTool("open", args || {}));
+        const mapped = mapArgPaths(args || {});
+        const names = Array.isArray(mapped.names) ? mapped.names : [];
+        const paths = Array.isArray(mapped.paths) ? mapped.paths : [];
+        const launched = [];
+        const restPaths = [];
+        const absDirs = [];
+        for (const p of paths) {
+          const path = String(p || "").trim();
+          if (!path) continue;
+          if (isForbiddenHostPath(path)) {
+            return uiFail({ error: "refuses AppData / agent temp workspace" }, "open rejected");
+          }
+          if (isAbsHostPath(path)) {
+            const st = await hostJson(
+              "GET",
+              "/api/exists?path=" + encodeURIComponent(path),
+              undefined,
+              SEARCH_TIMEOUT_MS
+            );
+            if (st && st.error) return uiFail(st, "open rejected");
+            if (st && st.exists && st.kind === "file") {
+              const launchedData = await hostJson("POST", "/api/open-external", { path }, UI_CMD_TIMEOUT_MS);
+              if (!launchedData || launchedData.ok === false) return uiFail(launchedData, "open-external failed");
+              launched.push(path);
+              continue;
+            }
+            if (st && st.exists && st.kind === "dir") {
+              absDirs.push(path);
+              continue;
+            }
+          }
+          restPaths.push(path);
+        }
+        if (absDirs.length && !names.length && !restPaths.length && !launched.length) {
+          return uiFail({ error: "path is a directory; use jump" }, "use jump");
+        }
+        if (!names.length && !restPaths.length) {
+          return { content: [{ type: "text", text: launched.length ? `ok: ${launched.join(", ")}` : "ok" }] };
+        }
+        const data = await runUiTool("open", { names, paths: restPaths });
+        if (!data || data.ok === false) return uiFail(data, "open failed");
+        const bits = [];
+        if (launched.length) bits.push(launched.join(", "));
+        if (data.path) bits.push(String(data.path));
+        if (Array.isArray(data.names) && data.names.length) bits.push(data.names.join(", "));
+        return { content: [{ type: "text", text: bits.length ? `ok: ${bits.join(" — ")}` : "ok" }] };
       },
     },
     select: {
@@ -473,9 +550,186 @@ function uiCustomTools() {
         return { content: [{ type: "text", text: bits.length ? `copied: ${bits.join(" — ")}` : "ok" }] };
       },
     },
+    exists: {
+      description:
+        "Check whether an absolute host path exists without changing the focused cosmos. Returns exists, kind (file|dir), and for directories up to ~40 immediate child names. Never AppData / stardust-ws-*. Do not use Test-Path.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute host path",
+          },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+      annotations: { title: "exists", readOnlyHint: true, openWorldHint: true },
+      async execute(args) {
+        const mapped = mapArgPaths(args || {});
+        const path = String((mapped && mapped.path) || "").trim();
+        if (!path) return uiFail({ error: "path is required" }, "exists failed");
+        if (isForbiddenHostPath(path)) {
+          return uiFail({ error: "refuses AppData / agent temp workspace" }, "exists rejected");
+        }
+        const data = await hostJson(
+          "GET",
+          "/api/exists?path=" + encodeURIComponent(path),
+          undefined,
+          SEARCH_TIMEOUT_MS
+        );
+        if (!data || data.ok === false) return uiFail(data, "exists failed");
+        if (!data.exists) return { content: [{ type: "text", text: "exists: false" }] };
+        if (data.kind === "dir") {
+          const kids = Array.isArray(data.children) ? data.children.join(", ") : "";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `exists: true kind=dir children=${kids || "(none)"}`,
+              },
+            ],
+          };
+        }
+        return { content: [{ type: "text", text: "exists: true kind=file" }] };
+      },
+    },
+    mkdir: {
+      description:
+        "Create a directory at an absolute host path. The parent must already exist (no recursive create). Refuse AppData / stardust-ws-*. If the parent is missing or the path is ambiguous, ask.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute host path of the new directory",
+          },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+      annotations: { title: "mkdir", openWorldHint: true },
+      async execute(args) {
+        const mapped = mapArgPaths(args || {});
+        const path = String((mapped && mapped.path) || "").trim();
+        if (!path) return uiFail({ error: "path is required" }, "mkdir failed");
+        if (isForbiddenHostPath(path)) {
+          return uiFail({ error: "refuses AppData / agent temp workspace" }, "mkdir rejected");
+        }
+        const data = await hostJson("POST", "/api/mkdir", { path }, UI_CMD_TIMEOUT_MS);
+        if (!data || data.ok === false) return uiFail(data, "mkdir failed");
+        return { content: [{ type: "text", text: `ok: ${path}` }] };
+      },
+    },
+    search: {
+      description:
+        "Search host files and folders with the same ranking as the StarDust search bar. Host HTTP, not the cosmos inbox. Does not change the focused pane. Few-second timeout; miss is No matches. One query per call. Optional root; default session/desktop. Never AppData. Use jump to go to a hit.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          q: {
+            type: "string",
+            description: "Name query (same as the search bar)",
+          },
+          root: {
+            type: "string",
+            description: "Optional absolute search root. Default is sessionRoot / desktop / defaultRoot.",
+          },
+        },
+        required: ["q"],
+        additionalProperties: false,
+      },
+      annotations: { title: "search", readOnlyHint: true, openWorldHint: true },
+      async execute(args) {
+        const mapped = mapArgPaths(args || {});
+        const q = String((mapped && mapped.q) || "").trim();
+        if (!q) return { content: [{ type: "text", text: "No matches" }] };
+        let root = String((mapped && mapped.root) || "").trim();
+        if (root && isForbiddenHostPath(root)) {
+          return uiFail({ error: "refuses AppData / agent temp workspace" }, "search rejected");
+        }
+        if (!root) {
+          const meta = await hostJson("GET", "/api/meta", undefined, 3000);
+          root = String(
+            (meta && (meta.sessionRoot || meta.desktopPath || meta.defaultRoot)) || ""
+          ).trim();
+        }
+        if (!root) return { content: [{ type: "text", text: "No matches" }] };
+        const data = await hostJson(
+          "GET",
+          "/api/search?root=" + encodeURIComponent(root) + "&q=" + encodeURIComponent(q),
+          undefined,
+          SEARCH_TIMEOUT_MS
+        );
+        if (!data || data.ok === false) {
+          return { content: [{ type: "text", text: "No matches" }] };
+        }
+        const hits = Array.isArray(data.hits) ? data.hits : [];
+        if (!hits.length) return { content: [{ type: "text", text: "No matches" }] };
+        const lines = hits.map((h) => {
+          const kind = h.kind || "file";
+          const name = h.name || "";
+          const path = h.path || "";
+          return `${kind}\t${name}\t${path}`;
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      },
+    },
+    jump: {
+      description:
+        "Jump the focused StarDust cosmos pane to a search hit or path. A folder opens in place. A file opens its parent folder and selects that file. Do not open a Windows viewer.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute host path of a folder or file",
+          },
+          name: {
+            type: "string",
+            description: "Star name in the focused cosmos (optional if path is set)",
+          },
+        },
+        additionalProperties: false,
+      },
+      annotations: { title: "jump", openWorldHint: true },
+      async execute(args) {
+        return uiOkText(await runUiTool("jump", args || {}));
+      },
+    },
+    "write-out": {
+      description:
+        "Write a generated payload to %USERPROFILE%\\.stardust-out (not the agent cwd, not Desktop, not AppData). Pass a file name (no folders) and text content. Returns the absolute path.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "File name only (for example notes.txt). No path separators.",
+          },
+          content: {
+            type: "string",
+            description: "UTF-8 text to write",
+          },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+      annotations: { title: "write-out", openWorldHint: true },
+      async execute(args) {
+        const data = await hostJson(
+          "POST",
+          "/api/agent-out/write",
+          { name: args && args.name, content: args && args.content ? String(args.content) : "" },
+          15000
+        );
+        if (!data || data.ok === false) return uiFail(data, "write-out failed");
+        return { content: [{ type: "text", text: data.path ? `wrote ${data.path}` : "ok" }] };
+      },
+    },
     "list-windows": {
       description:
-        "List visible top-level OS windows (title, pid, hwnd/id, outer bounds, visible client size, unusable flag for cloaked/tiny). Use before target-window. Not the StarDust cosmos.",
+        "List visible top-level OS windows (title, processName, pid, hwnd/id, outer bounds, client size, parked/iconic, unusable for cloaked/tiny). Optional url only when the title has a browser suffix (strip ' - Google Chrome' / Edge / Firefox) and leftover is not just the browser name. Never AppData. Call this before launching Chrome if a usable HWND may already exist. Use before target-window. Not the StarDust cosmos.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       annotations: { title: "list-windows", readOnlyHint: true, openWorldHint: true },
       async execute() {
@@ -488,8 +742,11 @@ function uiCustomTools() {
             const id = w.id || w.hwnd;
             const client =
               w.client_w != null && w.client_h != null ? ` client ${w.client_w}x${w.client_h}` : "";
+            const proc = w.processName ? ` process=${w.processName}` : "";
+            const url = w.url ? ` url=${w.url}` : "";
+            const parked = w.parked ? " parked" : "";
             const flag = w.unusable ? " unusable" : "";
-            return `${w.title} pid=${w.pid} id=${id} hwnd=${w.hwnd} ${w.w}x${w.h}@${w.x},${w.y}${client}${flag}`;
+            return `${w.title} pid=${w.pid}${proc} id=${id} hwnd=${w.hwnd} ${w.w}x${w.h}@${w.x},${w.y}${client}${parked}${flag}${url}`;
           })
           .join("\n");
         return { content: [{ type: "text", text: text || "(no windows)" }] };
@@ -617,7 +874,7 @@ function uiCustomTools() {
     },
     "run-ui": {
       description:
-        "Run up to 20 desktop-drive steps in one host call (target-window, look-*, window-click, window-type, drop-file, list-windows). Stops on miss, drop failure, new dialog, or composer-guard failure. Returns the final JPEG, or the failure JPEG. Insert look-* only when the next click would be a guess. Do not one-click-per-turn. Optional contact/header/expect: refuse window-type / Enter unless the last look title or a hit name contains that string, unless force is true. If those fields are omitted, generic apps are not blocked.",
+        "Run up to 20 desktop-drive steps in one host call (target-window, window-click, window-type, drop-file, list-windows). Do not pack look-at-window inside run-ui — look outside the burst. Stops on miss, drop failure, new dialog, or composer-guard failure. Returns the final JPEG, or the failure JPEG. Insert look-at-workarea/desktop only when the next click would be a guess. Do not one-click-per-turn. Optional contact/header/expect: refuse window-type / Enter unless the last look title or a hit name contains that string, unless force is true. If those fields are omitted, generic apps are not blocked.",
       inputSchema: {
         type: "object",
         properties: {
@@ -904,10 +1161,12 @@ async function runPrompt(thread, body, onEvent) {
     thread.needsContext = false;
     thread.pendingMessages = [];
   }
-  const rules = typeof body.rules === "string" ? body.rules.trim() : "";
+  let rules = typeof body.rules === "string" ? body.rules.trim() : "";
+  if (rules === APPDATA_LOCK) rules = "";
   if (rules) {
     fullPrompt = `${rules}\n\n${fullPrompt}`;
   }
+  fullPrompt = `${APPDATA_LOCK}\n\n${fullPrompt}`;
   if (!thread.uiHinted) {
     fullPrompt = `${UI_HINT}\n\n${fullPrompt}`;
     thread.uiHinted = true;
@@ -951,6 +1210,11 @@ async function runPrompt(thread, body, onEvent) {
     return { text: committed + text, status: "finished" };
   } finally {
     thread.activeRun = null;
+    try {
+      await hostJson("POST", "/api/agent-out/sweep", {}, 8000);
+    } catch {
+      /* ignore sweep errors */
+    }
   }
 }
 
@@ -1059,7 +1323,27 @@ async function handleStream(thread, body, res) {
   res.end();
 }
 
+async function cancelRun(thread) {
+  const run = thread && thread.activeRun;
+  if (run && typeof run.cancel === "function") {
+    try {
+      if (typeof run.supports !== "function" || run.supports("cancel")) {
+        await run.cancel();
+      }
+    } catch {
+      // cancel is best-effort
+    }
+  }
+}
+
+async function stopAllRuns() {
+  for (const t of threads.values()) {
+    await cancelRun(t);
+  }
+}
+
 async function handleDelete(threadId, res) {
+  await stopAllRuns();
   const thread = threads.get(threadId);
   if (!thread) {
     json(res, 404, { error: "thread not found" });
@@ -1071,16 +1355,12 @@ async function handleDelete(threadId, res) {
 }
 
 async function handleStop(thread, res) {
-  const run = thread.activeRun;
-  if (run && typeof run.cancel === "function") {
-    try {
-      if (typeof run.supports !== "function" || run.supports("cancel")) {
-        await run.cancel();
-      }
-    } catch {
-      // cancel is best-effort
-    }
-  }
+  await cancelRun(thread);
+  json(res, 200, { ok: true });
+}
+
+async function handleStopAll(res) {
+  await stopAllRuns();
   json(res, 200, { ok: true });
 }
 
@@ -1113,6 +1393,11 @@ async function handle(req, res) {
         }
       }
       json(res, 200, { ok: true, cwd: defaultCwd });
+      return;
+    }
+
+    if (method === "POST" && pathname === "/stop-all") {
+      await handleStopAll(res);
       return;
     }
 

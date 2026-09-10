@@ -26,12 +26,12 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW,
-    KillTimer, LoadCursorW, LoadImageW, PeekMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
+    KillTimer, LoadCursorW, LoadImageW, PeekMessageW, PostQuitMessage, RegisterClassW,
     SetTimer, SetWindowLongPtrW, ShowWindow, SystemParametersInfoW, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IMAGE_ICON,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HTCLIENT, IDC_ARROW, IMAGE_ICON,
     LR_DEFAULTSIZE, LR_LOADFROMFILE, LR_SHARED, MSG, PM_REMOVE, SC_RESTORE, SIZE_MAXIMIZED,
-    SIZE_RESTORED, SPI_GETWORKAREA, SPI_SETWORKAREA, SW_SHOW, WM_ACTIVATE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_EXITSIZEMOVE, WM_NCHITTEST, WM_SETICON, WM_SETTINGCHANGE, WM_SHOWWINDOW,
+    SIZE_MINIMIZED, SIZE_RESTORED, SPI_GETWORKAREA, SPI_SETWORKAREA, SW_SHOW, WM_ACTIVATE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_EXITSIZEMOVE, WM_NCHITTEST, WM_SETTINGCHANGE, WM_SHOWWINDOW,
     WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WNDCLASSW,
     WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
@@ -279,6 +279,9 @@ fn wait_with_pump(rx: mpsc::Receiver<Completed>) -> io::Result<*mut c_void> {
 }
 
 fn apply_bounds(controller: *mut c_void, hwnd: HWND) {
+    if fs_viz::shell::ime_blocks_bounds_focus_script(fs_viz::shell::ime_composing()) {
+        return;
+    }
     if controller.is_null() {
         return;
     }
@@ -295,6 +298,9 @@ fn apply_bounds(controller: *mut c_void, hwnd: HWND) {
         let f: unsafe extern "system" fn(*mut c_void, *const RECT) -> i32 =
             mem::transmute(*vtbl(controller).add(6));
         let _ = f(controller, &r);
+    }
+    if is_desktop_host(hwnd) {
+        fs_viz::shell::apply_cover_non_rude(hwnd);
     }
 }
 
@@ -343,6 +349,9 @@ fn resume_webview(hwnd: HWND) {
         unsafe {
             let _ = put_bool(controller, 4, 1);
         }
+        if fs_viz::shell::ime_blocks_bounds_focus_script(fs_viz::shell::ime_composing()) {
+            return;
+        }
         apply_bounds(controller, hwnd);
         unsafe {
             let _ = call0(controller, 23);
@@ -369,7 +378,14 @@ fn on_host_shown(hwnd: HWND) {
     // Restore from UiMode, not GWLP_USERDATA: exclusive fullscreen can restyle
     // the hwnd to overlapped while the in-app chrome is still StarDust UI.
     // Do not SetWindowPos z-order when the cover is already a work-area popup.
-    fs_viz::shell::restore_stardust_cover_if_wrong();
+    // IME/RIME activate must not restyle or resume WebView (flash). Other-app
+    // FG must not restyle (leave exclusive fullscreen alone).
+    if fs_viz::shell::ime_composing() || fs_viz::shell::cover_ime_ui_foreground() {
+        return;
+    }
+    if !fs_viz::shell::cover_other_user_app_foreground() {
+        fs_viz::shell::restore_stardust_cover_if_wrong();
+    }
     resume_webview(hwnd);
 }
 
@@ -383,6 +399,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         WM_ACTIVATE => {
+            if is_desktop_host(hwnd) {
+                fs_viz::shell::apply_cover_non_rude(hwnd);
+            }
             if (wparam as u32) & 0xFFFF != 0 {
                 on_host_shown(hwnd);
             }
@@ -401,7 +420,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_WINDOWPOSCHANGED => {
-            fs_viz::shell::restore_stardust_cover_if_wrong();
+            if !fs_viz::shell::cover_skip_restore_if_wrong() {
+                fs_viz::shell::restore_stardust_cover_if_wrong();
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_EXITSIZEMOVE => {
@@ -410,6 +431,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_SYSCOMMAND => {
             let cmd = (wparam as u32) & 0xFFF0;
+            if fs_viz::shell::cover_swallow_host_minimize(is_desktop_host(hwnd), cmd) {
+                return 0;
+            }
             let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             if cmd == SC_RESTORE {
                 on_host_shown(hwnd);
@@ -420,6 +444,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_host_shown(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        msg if msg == fs_viz::shell::WM_POWERBROADCAST => {
+            if fs_viz::shell::is_power_resume(wparam) {
+                // Sleep/lid: refresh heartbeat + rebuild hold so the guard does
+                // not yellow-failover, then force cover restyle and resume WebView2.
+                fs_viz::shell::touch_heartbeat();
+                fs_viz::shell::begin_rebuild_hold();
+                fs_viz::shell::restore_stardust_cover();
+                resume_webview(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        msg if msg != 0 && msg == fs_viz::shell::wm_open_cursor() => {
+            fs_viz::shell::open_cursor_from_view();
+            0
+        }
         WM_SETTINGCHANGE => {
             if is_work_area_change(wparam, lparam) {
                 on_host_shown(hwnd);
@@ -427,10 +466,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_SIZE => {
-            if wparam == SIZE_RESTORED as usize || wparam == SIZE_MAXIMIZED as usize {
+            if wparam == SIZE_MINIMIZED as usize {
+                fs_viz::shell::restore_stardust_cover();
+            } else if wparam == SIZE_RESTORED as usize || wparam == SIZE_MAXIMIZED as usize {
                 fs_viz::shell::restore_stardust_cover_if_wrong();
             }
-            CONTROLLER.with(|slot| apply_bounds(slot.get(), hwnd));
+            if !fs_viz::shell::ime_blocks_bounds_focus_script(fs_viz::shell::ime_composing()) {
+                CONTROLLER.with(|slot| apply_bounds(slot.get(), hwnd));
+            }
             0
         }
         WM_TIMER => {
@@ -446,6 +489,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let p = slot.replace(ptr::null_mut());
                 unsafe { release(p) };
             });
+            fs_viz::shell::uninstall_cover_cbt_hook();
             fs_viz::shell::sweep_host_tooltips_on_host_destroy();
             unsafe { PostQuitMessage(0) };
             0
@@ -522,16 +566,6 @@ fn load_stardust_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
     ICON.load(Ordering::Acquire) as _
 }
 
-fn apply_window_icon(hwnd: HWND, hicon: windows_sys::Win32::UI::WindowsAndMessaging::HICON) {
-    if hicon.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, hicon as isize);
-        let _ = SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, hicon as isize);
-    }
-}
-
 fn register_class() -> io::Result<()> {
     let class = wide(HOST_CLASS);
     let cursor = unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) };
@@ -565,7 +599,7 @@ fn create_hwnd(stardust_desktop: bool) -> io::Result<HWND> {
     let title = wide("StarDust");
     let (x, y, w, h, style) = if stardust_desktop {
         let (x, y, w, h) = work_area();
-        (x, y, w, h, WS_POPUP | WS_VISIBLE)
+        (x, y, w, h, WS_POPUP)
     } else {
         (
             CW_USEDEFAULT,
@@ -595,12 +629,14 @@ fn create_hwnd(stardust_desktop: bool) -> io::Result<HWND> {
     if hwnd.is_null() {
         return Err(io_err("CreateWindowExW failed"));
     }
-    apply_window_icon(hwnd, load_stardust_icon());
+    fs_viz::shell::apply_host_window_icons(hwnd, !stardust_desktop);
     if stardust_desktop {
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 1);
         }
         dwm_disable_nc(hwnd);
+        fs_viz::shell::install_cover_cbt_hook();
+        fs_viz::shell::apply_cover_non_rude(hwnd);
     }
     Ok(hwnd)
 }
@@ -851,6 +887,9 @@ pub fn run(url: &str, user_data: &Path, stardust_desktop: bool) -> io::Result<()
     apply_bounds(controller, hwnd);
     unsafe {
         let _ = put_bool(controller, 4, 1); // SetIsVisible
+    }
+    if stardust_desktop {
+        fs_viz::shell::apply_cover_non_rude(hwnd);
     }
     type GetObj = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
     let get_webview: GetObj = unsafe { mem::transmute(*vtbl(controller).add(25)) };

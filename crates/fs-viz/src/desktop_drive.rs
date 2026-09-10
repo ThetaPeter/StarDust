@@ -22,6 +22,8 @@ const TINY_CLIENT_H: i32 = 40;
 const CLOAK_ORIGIN: i32 = 32000;
 const MAX_HITS: usize = 120;
 const CLASS_HOST: &str = "StarDustHost";
+const UNDOCK_MARGIN: i32 = 16;
+const MIN_SLOT: i32 = 8;
 
 static OLE_ONCE: Once = Once::new();
 static PRINT_WINDOW: OnceLock<Option<PrintWindowFn>> = OnceLock::new();
@@ -36,6 +38,22 @@ static STATE: Mutex<DriveState> = Mutex::new(DriveState {
     src_h: 0,
     last_title: String::new(),
     last_hits: Vec::new(),
+    peek_x: 0,
+    peek_y: 0,
+    peek_w: 0,
+    peek_h: 0,
+    peek_held: false,
+    peek_active: false,
+    peek_hwnd: 0,
+    peek_prev_fg: 0,
+    undocked: Vec::new(),
+    slotted: Vec::new(),
+    saved_hwnd: 0,
+    saved_l: 0,
+    saved_t: 0,
+    saved_w: 0,
+    saved_h: 0,
+    saved_ok: false,
 });
 
 struct DriveState {
@@ -48,6 +66,22 @@ struct DriveState {
     src_h: i32,
     last_title: String,
     last_hits: Vec<Hit>,
+    peek_x: i32,
+    peek_y: i32,
+    peek_w: i32,
+    peek_h: i32,
+    peek_held: bool,
+    peek_active: bool,
+    peek_hwnd: usize,
+    peek_prev_fg: usize,
+    undocked: Vec<usize>,
+    slotted: Vec<usize>,
+    saved_hwnd: usize,
+    saved_l: i32,
+    saved_t: i32,
+    saved_w: i32,
+    saved_h: i32,
+    saved_ok: bool,
 }
 
 type PrintWindowFn = unsafe extern "system" fn(HWND, windows_sys::Win32::Graphics::Gdi::HDC, u32) -> BOOL;
@@ -82,6 +116,68 @@ fn title_of(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
+/// Visible page leftover after a browser suffix. Never AppData. Empty/browser-only → None.
+fn title_browser_url(title: &str) -> Option<String> {
+    const SUFFIXES: &[&str] = &[
+        " - google chrome",
+        " - microsoft edge",
+        " - mozilla firefox",
+    ];
+    const BROWSER_NAMES: &[&str] = &[
+        "Google Chrome",
+        "Microsoft Edge",
+        "Mozilla Firefox",
+        "Chrome",
+        "Edge",
+        "Firefox",
+    ];
+    let lower = title.to_ascii_lowercase();
+    for suf in SUFFIXES {
+        if let Some(idx) = lower.rfind(suf) {
+            if idx + suf.len() != lower.len() {
+                continue;
+            }
+            let prefix = title[..idx].trim();
+            if prefix.is_empty() {
+                return None;
+            }
+            if BROWSER_NAMES.iter().any(|b| prefix.eq_ignore_ascii_case(b)) {
+                return None;
+            }
+            return Some(prefix.to_string());
+        }
+    }
+    None
+}
+
+fn process_image_stem(pid: u32) -> String {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return String::new();
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+        let _ = CloseHandle(h);
+        if ok == 0 || len == 0 {
+            return String::new();
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        Path::new(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
 fn hwnd_from_usize(h: usize) -> HWND {
     h as HWND
 }
@@ -102,6 +198,354 @@ fn window_rect(hwnd: HWND) -> Option<RECT> {
         None
     } else {
         Some(r)
+    }
+}
+
+fn hwnd_is_iconic(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
+    !hwnd.is_null() && unsafe { IsIconic(hwnd) } != 0
+}
+
+fn json_i32(args: &Value, key: &str) -> Option<i32> {
+    let x = args.get(key)?;
+    if let Some(n) = x.as_i64() {
+        return Some(n as i32);
+    }
+    if let Some(n) = x.as_u64() {
+        if n > i32::MAX as u64 {
+            return None;
+        }
+        return Some(n as i32);
+    }
+    if let Some(n) = x.as_f64() {
+        if !n.is_finite() {
+            return None;
+        }
+        return Some(n.round() as i32);
+    }
+    if let Some(s) = x.as_str() {
+        let t = s.trim();
+        if let Ok(n) = t.parse::<i32>() {
+            return Some(n);
+        }
+        if let Ok(n) = t.parse::<f64>() {
+            if n.is_finite() {
+                return Some(n.round() as i32);
+            }
+        }
+    }
+    None
+}
+
+fn stored_peek_slot() -> Option<(i32, i32, i32, i32)> {
+    let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if st.peek_w < MIN_SLOT || st.peek_h < MIN_SLOT {
+        None
+    } else {
+        Some((st.peek_x, st.peek_y, st.peek_w, st.peek_h))
+    }
+}
+
+fn set_peek_slot(args: &Value) -> ApiResult {
+    let x = json_i32(args, "x").ok_or_else(|| ApiError::bad("peek-slot needs x"))?;
+    let y = json_i32(args, "y").ok_or_else(|| ApiError::bad("peek-slot needs y"))?;
+    let w = json_i32(args, "w").ok_or_else(|| ApiError::bad("peek-slot needs w"))?;
+    let h = json_i32(args, "h").ok_or_else(|| ApiError::bad("peek-slot needs h"))?;
+    if w < MIN_SLOT || h < MIN_SLOT {
+        return Err(ApiError::bad("peek-slot cosmos rect is too small"));
+    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.peek_x = x;
+    st.peek_y = y;
+    st.peek_w = w;
+    st.peek_h = h;
+    drop(st);
+    Ok(json!({ "ok": true, "x": x, "y": y, "w": w, "h": h }))
+}
+
+fn fit_into_slot(win_w: i32, win_h: i32, slot_w: i32, slot_h: i32) -> (i32, i32) {
+    (win_w.min(slot_w).max(1), win_h.min(slot_h).max(1))
+}
+
+/// Restore the pre-burst foreground unless the user switched to a third app.
+/// Never restore StarDustHost.
+fn should_restore_prev_fg(now: usize, target: usize, prev: usize, prev_is_host: bool) -> bool {
+    if prev == 0 || prev_is_host {
+        return false;
+    }
+    let switched = now != 0 && now != target && now != prev;
+    !switched
+}
+
+/// Drag = undock: origin left the dock slot by more than 16px in x or y.
+/// Resize in place (origin still near the slot) stays docked.
+fn drag_away_from_dock(wx: i32, wy: i32, sx: i32, sy: i32) -> bool {
+    (wx - sx).abs() > UNDOCK_MARGIN || (wy - sy).abs() > UNDOCK_MARGIN
+}
+
+fn hwnd_is_undocked(hwnd: HWND) -> bool {
+    let id = usize_from_hwnd(hwnd);
+    STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .undocked
+        .contains(&id)
+}
+
+fn hwnd_was_slotted(hwnd: HWND) -> bool {
+    let id = usize_from_hwnd(hwnd);
+    STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .slotted
+        .contains(&id)
+}
+
+fn mark_hwnd_undocked(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let id = usize_from_hwnd(hwnd);
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.undocked.contains(&id) {
+        st.undocked.push(id);
+    }
+}
+
+fn mark_hwnd_slotted(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let id = usize_from_hwnd(hwnd);
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.slotted.contains(&id) {
+        st.slotted.push(id);
+    }
+}
+
+fn note_undock_from_rect(hwnd: HWND) {
+    if hwnd.is_null() || hwnd_is_iconic(hwnd) || hwnd_is_undocked(hwnd) {
+        return;
+    }
+    if !hwnd_was_slotted(hwnd) {
+        return;
+    }
+    let Some(r) = window_rect(hwnd) else {
+        return;
+    };
+    if r.left.abs() >= CLOAK_ORIGIN || r.top.abs() >= CLOAK_ORIGIN {
+        return;
+    }
+    let Some((sx, sy, _, _)) = stored_peek_slot() else {
+        return;
+    };
+    if drag_away_from_dock(r.left, r.top, sx, sy) {
+        mark_hwnd_undocked(hwnd);
+    }
+}
+
+fn restore_driven_visible(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_RESTORE};
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if hwnd_is_iconic(hwnd) || IsWindowVisible(hwnd) == 0 {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+}
+
+fn capture_user_frame(hwnd: HWND) {
+    if hwnd.is_null() || hwnd_is_iconic(hwnd) {
+        return;
+    }
+    let id = usize_from_hwnd(hwnd);
+    let Some(r) = window_rect(hwnd) else {
+        return;
+    };
+    let w = (r.right - r.left).max(0);
+    let h = (r.bottom - r.top).max(0);
+    if w < MIN_SLOT || h < MIN_SLOT {
+        return;
+    }
+    if r.left.abs() >= CLOAK_ORIGIN || r.top.abs() >= CLOAK_ORIGIN {
+        return;
+    }
+    let in_slot = stored_peek_slot()
+        .map(|(sx, sy, _, _)| !drag_away_from_dock(r.left, r.top, sx, sy))
+        .unwrap_or(false);
+    {
+        let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if st.saved_ok && st.saved_hwnd == id && (in_slot || hwnd_is_iconic(hwnd)) {
+            return;
+        }
+        if st.saved_ok && st.saved_hwnd == id {
+            return;
+        }
+    }
+    if in_slot {
+        return;
+    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.saved_hwnd = id;
+    st.saved_l = r.left;
+    st.saved_t = r.top;
+    st.saved_w = w;
+    st.saved_h = h;
+    st.saved_ok = true;
+}
+
+/// Place the driven HWND in the cosmos slot. Never SetWindowPos StarDustHost.
+/// HWND_TOP on the driven window only (not TOPMOST, not on the host).
+fn place_in_slot(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
+    };
+    if hwnd.is_null() || class_of(hwnd) == CLASS_HOST {
+        return;
+    }
+    restore_driven_visible(hwnd);
+    note_undock_from_rect(hwnd);
+    if hwnd_is_undocked(hwnd) {
+        return;
+    }
+    capture_user_frame(hwnd);
+    let Some((sx, sy, sw, sh)) = stored_peek_slot() else {
+        return;
+    };
+    let (nw, nh) = match window_rect(hwnd) {
+        Some(r) => {
+            let cw = (r.right - r.left).max(1);
+            let ch = (r.bottom - r.top).max(1);
+            fit_into_slot(cw, ch, sw, sh)
+        }
+        None => (sw.max(1), sh.max(1)),
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            sx,
+            sy,
+            nw,
+            nh,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+    mark_hwnd_slotted(hwnd);
+}
+
+fn raise_target(target: HWND) -> HWND {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    let prev_fg = unsafe { GetForegroundWindow() };
+    if target.is_null() || class_of(target) == CLASS_HOST {
+        return prev_fg;
+    }
+    unsafe {
+        let our = GetCurrentThreadId();
+        let mut pid = 0u32;
+        let their = GetWindowThreadProcessId(target, &mut pid);
+        if their != 0 && their != our {
+            let _ = AttachThreadInput(our, their, 1);
+        }
+        let _ = SetForegroundWindow(target);
+        if their != 0 && their != our {
+            let _ = AttachThreadInput(our, their, 0);
+        }
+    }
+    prev_fg
+}
+
+fn peek_enter(hwnd: HWND) {
+    if hwnd.is_null() || class_of(hwnd) == CLASS_HOST {
+        return;
+    }
+    note_undock_from_rect(hwnd);
+    let (active, same) = {
+        let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let id = usize_from_hwnd(hwnd);
+        (st.peek_active, st.peek_active && st.peek_hwnd == id)
+    };
+    if same {
+        place_in_slot(hwnd);
+        return;
+    }
+    if active {
+        peek_finish();
+    }
+    place_in_slot(hwnd);
+    let prev_fg = raise_target(hwnd);
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.peek_active = true;
+    st.peek_hwnd = usize_from_hwnd(hwnd);
+    st.peek_prev_fg = usize_from_hwnd(prev_fg);
+}
+
+fn peek_finish() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let (target, prev) = {
+        let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.peek_active {
+            return;
+        }
+        let target = hwnd_from_usize(st.peek_hwnd);
+        let prev = hwnd_from_usize(st.peek_prev_fg);
+        st.peek_active = false;
+        st.peek_hwnd = 0;
+        st.peek_prev_fg = 0;
+        (target, prev)
+    };
+    if target.is_null() || class_of(target) == CLASS_HOST {
+        return;
+    }
+    note_undock_from_rect(target);
+    let now = unsafe { GetForegroundWindow() };
+    let prev_is_host = !prev.is_null() && class_of(prev) == CLASS_HOST;
+    if should_restore_prev_fg(
+        usize_from_hwnd(now),
+        usize_from_hwnd(target),
+        usize_from_hwnd(prev),
+        prev_is_host,
+    ) && !prev.is_null()
+        && !prev_is_host
+    {
+        unsafe {
+            let _ = SetForegroundWindow(prev);
+        }
+    }
+}
+
+fn peek_leave_unless_held() {
+    let held = STATE.lock().unwrap_or_else(|e| e.into_inner()).peek_held;
+    if !held {
+        peek_finish();
+    }
+}
+
+fn with_peek<T>(hwnd: HWND, f: impl FnOnce() -> T) -> T {
+    peek_enter(hwnd);
+    let out = f();
+    peek_leave_unless_held();
+    out
+}
+
+struct RunPeekHold;
+
+impl RunPeekHold {
+    fn enter() -> Self {
+        STATE.lock().unwrap_or_else(|e| e.into_inner()).peek_held = true;
+        Self
+    }
+}
+
+impl Drop for RunPeekHold {
+    fn drop(&mut self) {
+        peek_finish();
+        STATE.lock().unwrap_or_else(|e| e.into_inner()).peek_held = false;
     }
 }
 
@@ -1113,11 +1557,14 @@ struct WinInfo {
     client_w: i32,
     client_h: i32,
     unusable: bool,
+    parked: bool,
+    process_name: String,
+    url: Option<String>,
 }
 
 impl WinInfo {
     fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "title": self.title,
             "class": self.class,
             "pid": self.pid,
@@ -1130,7 +1577,13 @@ impl WinInfo {
             "client_w": self.client_w,
             "client_h": self.client_h,
             "unusable": self.unusable,
-        })
+            "parked": self.parked,
+            "processName": self.process_name,
+        });
+        if let Some(ref url) = self.url {
+            v["url"] = json!(url);
+        }
+        v
     }
 }
 
@@ -1220,7 +1673,8 @@ unsafe extern "system" fn enum_list(hwnd: HWND, lparam: LPARAM) -> BOOL {
     };
     let acc = lparam as *mut ListAcc;
     unsafe {
-        if IsWindowVisible(hwnd) == 0 {
+        let parked = hwnd_is_iconic(hwnd);
+        if IsWindowVisible(hwnd) == 0 && !parked {
             return 1;
         }
         let class = class_of(hwnd);
@@ -1245,6 +1699,8 @@ unsafe extern "system" fn enum_list(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let (cw, ch) = client_size(hwnd);
         let cloaked = window_cloaked(hwnd);
         let unusable = window_unusable(r.left, r.top, cw, ch, cloaked);
+        let process_name = process_image_stem(pid);
+        let url = title_browser_url(&title);
         (*acc).rows.push(WinInfo {
             title,
             class,
@@ -1257,6 +1713,9 @@ unsafe extern "system" fn enum_list(hwnd: HWND, lparam: LPARAM) -> BOOL {
             client_w: cw,
             client_h: ch,
             unusable,
+            parked,
+            process_name,
+            url,
         });
     }
     1
@@ -1336,12 +1795,14 @@ fn look_at_window(args: &Value) -> ApiResult {
         STATE.lock().unwrap_or_else(|e| e.into_inner()).target = usize_from_hwnd(h);
         h
     };
-    let r = window_rect(hwnd).ok_or_else(|| ApiError::bad("GetWindowRect failed"))?;
-    let w = r.right - r.left;
-    let h = r.bottom - r.top;
-    let (jpeg, bw, bh) = capture_rect(r.left, r.top, w, h, Some(hwnd))?;
-    let hits = collect_hits(hwnd, r, bw, bh);
-    Ok(look_payload(jpeg, bw, bh, r, &title_of(hwnd), hits, None))
+    with_peek(hwnd, || {
+        let r = window_rect(hwnd).ok_or_else(|| ApiError::bad("GetWindowRect failed"))?;
+        let w = r.right - r.left;
+        let h = r.bottom - r.top;
+        let (jpeg, bw, bh) = capture_rect(r.left, r.top, w, h, Some(hwnd))?;
+        let hits = collect_hits(hwnd, r, bw, bh);
+        Ok(look_payload(jpeg, bw, bh, r, &title_of(hwnd), hits, None))
+    })
 }
 
 fn look_at_workarea() -> ApiResult {
@@ -1437,51 +1898,6 @@ fn screen_to_client(hwnd: HWND, sx: i32, sy: i32) -> POINT {
     p
 }
 
-struct Burst {
-    prev_fg: HWND,
-    target: HWND,
-}
-
-fn begin_burst(target: HWND) -> Burst {
-    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
-    };
-    let prev_fg = unsafe { GetForegroundWindow() };
-    if class_of(target) == CLASS_HOST {
-        return Burst { prev_fg, target };
-    }
-    unsafe {
-        let our = GetCurrentThreadId();
-        let mut pid = 0u32;
-        let their = GetWindowThreadProcessId(target, &mut pid);
-        if their != 0 && their != our {
-            let _ = AttachThreadInput(our, their, 1);
-        }
-        let _ = SetForegroundWindow(target);
-        if their != 0 && their != our {
-            let _ = AttachThreadInput(our, their, 0);
-        }
-    }
-    Burst { prev_fg, target }
-}
-
-fn end_burst(burst: Burst) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
-    if burst.target.is_null() || class_of(burst.target) == CLASS_HOST {
-        return;
-    }
-    let now = unsafe { GetForegroundWindow() };
-    if now != burst.target {
-        return;
-    }
-    if !burst.prev_fg.is_null() && class_of(burst.prev_fg) != CLASS_HOST {
-        unsafe {
-            let _ = SetForegroundWindow(burst.prev_fg);
-        }
-    }
-}
-
 fn post_click(hwnd: HWND, client: POINT) {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -1521,73 +1937,73 @@ fn window_click(args: &Value) -> ApiResult {
     if class_of(hwnd) == CLASS_HOST {
         return Err(ApiError::bad("refusing to drive StarDustHost"));
     }
-    let mut x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let mut y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let mut on_hit = false;
-    if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
-        if !name.is_empty() {
-            let r = window_rect(hwnd).ok_or_else(|| ApiError::bad("GetWindowRect failed"))?;
-            let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            let bw = st.bmp_w.max(1);
-            let bh = st.bmp_h.max(1);
-            let mut hits = st.last_hits.clone();
-            drop(st);
-            if hits.is_empty() {
-                hits = collect_hits(hwnd, r, bw, bh);
-            }
-            let needle = name.to_ascii_lowercase();
-            let hit = hits.iter().find(|h| h.name.to_ascii_lowercase().contains(&needle));
-            match hit {
-                Some(h) => {
-                    x = h.x + h.w / 2;
-                    y = h.y + h.h / 2;
-                    on_hit = true;
+    with_peek(hwnd, || {
+        let mut x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let mut y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let mut on_hit = false;
+        if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                let r = window_rect(hwnd).ok_or_else(|| ApiError::bad("GetWindowRect failed"))?;
+                let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let bw = st.bmp_w.max(1);
+                let bh = st.bmp_h.max(1);
+                let mut hits = st.last_hits.clone();
+                drop(st);
+                if hits.is_empty() {
+                    hits = collect_hits(hwnd, r, bw, bh);
                 }
-                None => {
-                    let fresh = collect_hits(hwnd, r, bw, bh);
-                    let hit = fresh
-                        .iter()
-                        .find(|h| h.name.to_ascii_lowercase().contains(&needle));
-                    match hit {
-                        Some(h) => {
-                            x = h.x + h.w / 2;
-                            y = h.y + h.h / 2;
-                            on_hit = true;
+                let needle = name.to_ascii_lowercase();
+                let hit = hits.iter().find(|h| h.name.to_ascii_lowercase().contains(&needle));
+                match hit {
+                    Some(h) => {
+                        x = h.x + h.w / 2;
+                        y = h.y + h.h / 2;
+                        on_hit = true;
+                    }
+                    None => {
+                        let fresh = collect_hits(hwnd, r, bw, bh);
+                        let hit = fresh
+                            .iter()
+                            .find(|h| h.name.to_ascii_lowercase().contains(&needle));
+                        match hit {
+                            Some(h) => {
+                                x = h.x + h.w / 2;
+                                y = h.y + h.h / 2;
+                                on_hit = true;
+                            }
+                            None => return Err(ApiError::bad("no hit-list control matches that name")),
                         }
-                        None => return Err(ApiError::bad("no hit-list control matches that name")),
                     }
                 }
             }
         }
-    }
-    if !on_hit {
-        let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        on_hit = point_in_hits(x, y, &st.last_hits);
-    }
-    let before = if on_hit {
-        None
-    } else {
-        window_fingerprint(hwnd)
-    };
-    let (sx, sy) = bitmap_to_screen(x, y);
-    let client = screen_to_client(hwnd, sx, sy);
-    let burst = begin_burst(hwnd);
-    post_click(hwnd, client);
-    end_burst(burst);
-    if !on_hit {
-        std::thread::sleep(Duration::from_millis(80));
-        let after = window_fingerprint(hwnd);
-        let changed = match (before, after) {
-            (Some(a), Some(b)) => a != b,
-            _ => true,
-        };
-        if coord_click_miss(on_hit, changed) {
-            return Err(ApiError::bad(
-                "miss: coordinate click did not change the target UI",
-            ));
+        if !on_hit {
+            let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            on_hit = point_in_hits(x, y, &st.last_hits);
         }
-    }
-    Ok(json!({ "ok": true, "x": x, "y": y }))
+        let before = if on_hit {
+            None
+        } else {
+            window_fingerprint(hwnd)
+        };
+        let (sx, sy) = bitmap_to_screen(x, y);
+        let client = screen_to_client(hwnd, sx, sy);
+        post_click(hwnd, client);
+        if !on_hit {
+            std::thread::sleep(Duration::from_millis(80));
+            let after = window_fingerprint(hwnd);
+            let changed = match (before, after) {
+                (Some(a), Some(b)) => a != b,
+                _ => true,
+            };
+            if coord_click_miss(on_hit, changed) {
+                return Err(ApiError::bad(
+                    "miss: coordinate click did not change the target UI",
+                ));
+            }
+        }
+        Ok(json!({ "ok": true, "x": x, "y": y }))
+    })
 }
 
 fn key_event(vk: u16, up: bool) {
@@ -1713,22 +2129,21 @@ fn window_type(args: &Value) -> ApiResult {
     composer_guard(args, args)?;
     let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let chord = args.get("chord").and_then(|v| v.as_str()).unwrap_or("");
-    let burst = begin_burst(hwnd);
-    if !chord.is_empty() && !type_chord(chord) {
-        end_burst(burst);
-        return Err(ApiError::bad("unsupported chord"));
-    }
-    if !text.is_empty() && parse_chord(text).is_none() {
-        for ch in text.chars() {
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_CHAR, ch as usize, 0);
-            }
+    with_peek(hwnd, || {
+        if !chord.is_empty() && !type_chord(chord) {
+            return Err(ApiError::bad("unsupported chord"));
         }
-    } else if !text.is_empty() {
-        let _ = type_chord(text);
-    }
-    end_burst(burst);
-    Ok(json!({ "ok": true }))
+        if !text.is_empty() && parse_chord(text).is_none() {
+            for ch in text.chars() {
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_CHAR, ch as usize, 0);
+                }
+            }
+        } else if !text.is_empty() {
+            let _ = type_chord(text);
+        }
+        Ok(json!({ "ok": true }))
+    })
 }
 
 fn make_hdrop(path: &Path) -> Result<windows_sys::Win32::Foundation::HGLOBAL, ApiError> {
@@ -1780,31 +2195,31 @@ fn drop_file(args: &Value) -> ApiResult {
     }
     let path_s = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let path = parse_abs_file(path_s)?;
-    let hdrop = make_hdrop(&path)?;
-    let hdrop2 = make_hdrop(&path)?;
-    let mut result = 0usize;
-    unsafe {
-        let _ = SendMessageTimeoutW(
-            hwnd,
-            WM_DROPFILES,
-            hdrop as usize,
-            0,
-            SMTO_ABORTIFHUNG,
-            1500,
-            &mut result,
-        );
-        if OpenClipboard(ptr::null_mut()) != 0 {
-            let _ = EmptyClipboard();
-            let _ = SetClipboardData(CF_HDROP as u32, hdrop2);
-            let _ = CloseClipboard();
-        } else {
-            let _ = windows_sys::Win32::Foundation::GlobalFree(hdrop2);
+    with_peek(hwnd, || {
+        let hdrop = make_hdrop(&path)?;
+        let hdrop2 = make_hdrop(&path)?;
+        let mut result = 0usize;
+        unsafe {
+            let _ = SendMessageTimeoutW(
+                hwnd,
+                WM_DROPFILES,
+                hdrop as usize,
+                0,
+                SMTO_ABORTIFHUNG,
+                1500,
+                &mut result,
+            );
+            if OpenClipboard(ptr::null_mut()) != 0 {
+                let _ = EmptyClipboard();
+                let _ = SetClipboardData(CF_HDROP as u32, hdrop2);
+                let _ = CloseClipboard();
+            } else {
+                let _ = windows_sys::Win32::Foundation::GlobalFree(hdrop2);
+            }
         }
-    }
-    let burst = begin_burst(hwnd);
-    type_chord("Ctrl+V");
-    end_burst(burst);
-    Ok(json!({ "ok": true, "path": path.display().to_string() }))
+        type_chord("Ctrl+V");
+        Ok(json!({ "ok": true, "path": path.display().to_string() }))
+    })
 }
 
 fn surprise_dialog(target: HWND) -> Option<HWND> {
@@ -1839,6 +2254,7 @@ fn dispatch(op: &str, args: &Value) -> ApiResult {
         "window-click" => window_click(args),
         "window-type" => window_type(args),
         "drop-file" => drop_file(args),
+        "peek-slot" => set_peek_slot(args),
         other => Err(ApiError::bad(format!("unknown drive op {other}"))),
     }
 }
@@ -1853,6 +2269,7 @@ fn run_ui(args: &Value) -> ApiResult {
             "run-ui max {MAX_RUN_STEPS} steps; split the task"
         )));
     }
+    let _hold = RunPeekHold::enter();
     let mut checkpoint: Option<Value> = None;
     for (i, step) in steps.iter().enumerate() {
         let op = step.get("op").and_then(|v| v.as_str()).unwrap_or("");
@@ -2029,6 +2446,9 @@ mod tests {
                 client_w: 990,
                 client_h: 1000,
                 unusable: false,
+                parked: false,
+                process_name: String::new(),
+                url: None,
             },
             WinInfo {
                 title: "(3) WhatsApp".into(),
@@ -2042,6 +2462,9 @@ mod tests {
                 client_w: 970,
                 client_h: 980,
                 unusable: false,
+                parked: false,
+                process_name: String::new(),
+                url: None,
             },
             WinInfo {
                 title: "WhatsApp".into(),
@@ -2055,6 +2478,9 @@ mod tests {
                 client_w: 199,
                 client_h: 34,
                 unusable: true,
+                parked: false,
+                process_name: String::new(),
+                url: None,
             },
         ]
     }
@@ -2176,5 +2602,125 @@ mod tests {
         assert_eq!(v["ok"], false);
         let err = v["error"].as_str().unwrap_or("");
         assert!(err.contains("target"), "{err}");
+    }
+
+    #[test]
+    fn peek_slot() {
+        let v = set_peek_slot(&json!({ "x": 540, "y": 80, "w": 800, "h": 600 })).expect("slot");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["x"], 540);
+        assert_eq!(v["y"], 80);
+        assert_eq!(v["w"], 800);
+        assert_eq!(v["h"], 600);
+        {
+            let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(st.peek_x, 540);
+            assert_eq!(st.peek_y, 80);
+            assert_eq!(st.peek_w, 800);
+            assert_eq!(st.peek_h, 600);
+        }
+        let err = set_peek_slot(&json!({ "x": 1, "y": 1, "w": 4, "h": 4 })).expect_err("tiny");
+        let msg = err.body["error"].as_str().unwrap_or("");
+        assert!(msg.contains("too small"), "{msg}");
+        let missing = set_peek_slot(&json!({ "x": 10, "y": 10 })).expect_err("missing");
+        let msg = missing.body["error"].as_str().unwrap_or("");
+        assert!(msg.contains("peek-slot needs"), "{msg}");
+    }
+
+    #[test]
+    fn fit_into_slot_shrinks_if_larger() {
+        assert_eq!(fit_into_slot(1000, 1028, 800, 600), (800, 600));
+        assert_eq!(fit_into_slot(400, 300, 800, 600), (400, 300));
+        assert_eq!(fit_into_slot(800, 1000, 800, 600), (800, 600));
+    }
+
+    #[test]
+    fn should_restore_prev_fg() {
+        assert!(
+            !super::should_restore_prev_fg(2, 2, 1, true),
+            "never restore when prev_is_host"
+        );
+        assert!(
+            !super::should_restore_prev_fg(1, 2, 1, true),
+            "never restore StarDustHost"
+        );
+        assert!(
+            super::should_restore_prev_fg(2, 2, 3, false),
+            "restore when still on target and prev is another app"
+        );
+        assert!(
+            !super::should_restore_prev_fg(4, 2, 3, false),
+            "no restore when user switched"
+        );
+        assert!(!super::should_restore_prev_fg(2, 2, 0, false), "no restore when prev=0");
+    }
+
+    #[test]
+    fn drag_away_from_dock_is_undock() {
+        assert!(
+            drag_away_from_dock(523, 80, 540, 80),
+            "origin left past 16px is undock"
+        );
+        assert!(
+            drag_away_from_dock(540, 97, 540, 80),
+            "origin down past 16px is undock"
+        );
+        assert!(!drag_away_from_dock(540, 80, 540, 80), "origin at slot stays docked");
+        assert!(
+            !drag_away_from_dock(548, 80, 540, 80),
+            "origin within 8px stays docked"
+        );
+    }
+
+    #[test]
+    fn list_includes_parked() {
+        let mut rows = sample_windows();
+        rows[2].parked = true;
+        let json = rows[2].to_json();
+        assert_eq!(json["parked"], true);
+        assert_eq!(json["processName"], "");
+        assert!(json.get("url").is_none());
+        assert_eq!(sample_windows()[0].to_json()["parked"], false);
+        assert_eq!(
+            pick_target(&rows, "", None, Some(30)).unwrap(),
+            30,
+            "pid/id still binds a parked row"
+        );
+    }
+
+    #[test]
+    fn title_browser_url_strips_browser_suffix() {
+        assert_eq!(
+            title_browser_url("https://blackboard.cuhk.edu.hk - Google Chrome").as_deref(),
+            Some("https://blackboard.cuhk.edu.hk")
+        );
+        assert_eq!(
+            title_browser_url("MATH3270 - Microsoft Edge").as_deref(),
+            Some("MATH3270")
+        );
+        assert_eq!(
+            title_browser_url("GitHub - Mozilla Firefox").as_deref(),
+            Some("GitHub")
+        );
+        assert_eq!(title_browser_url("Google Chrome"), None);
+        assert_eq!(title_browser_url("Microsoft Edge"), None);
+        assert_eq!(title_browser_url("Mozilla Firefox"), None);
+        assert_eq!(title_browser_url("Google Chrome - Google Chrome"), None);
+        assert_eq!(title_browser_url("WhatsApp"), None);
+    }
+
+    #[test]
+    fn title_only_still_rejects_cloaked_parked_strip() {
+        let mut only = sample_windows()[2].clone();
+        only.parked = true;
+        let err = pick_target(&[only], "WhatsApp", None, None).unwrap_err();
+        match err {
+            PickErr::UnusableOnly(cands) => {
+                assert_eq!(cands.len(), 1);
+                assert!(cands[0].parked);
+                assert!(cands[0].unusable);
+            }
+            other => panic!("expected unusable-only, got {other:?}"),
+        }
     }
 }

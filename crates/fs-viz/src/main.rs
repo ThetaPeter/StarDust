@@ -707,7 +707,25 @@ fn handle(mut stream: TcpStream) {
         ("GET", "/api/search") => {
             let root = q.get("root").map(String::as_str).unwrap_or("");
             let qs = q.get("q").map(String::as_str).unwrap_or("");
-            reply_api(&mut stream, host::search(root, qs));
+            let streaming = q
+                .get("stream")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if streaming {
+                match host::search_prepare(root, qs) {
+                    Err(e) => reply_api(&mut stream, Err(e)),
+                    Ok(()) => {
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(180)));
+                        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+                        if stream.write_all(headers.as_bytes()).is_ok() {
+                            let _ = stream.flush();
+                            let _ = host::search_ndjson(root, qs, &mut stream);
+                        }
+                    }
+                }
+            } else {
+                reply_api(&mut stream, host::search(root, qs));
+            }
         }
         ("POST", "/api/open-external") => match body_json(&req) {
             Ok(v) => match json_str(&v, "path") {
@@ -719,6 +737,10 @@ fn handle(mut stream: TcpStream) {
         ("GET", "/api/stat") => {
             let path = q.get("path").map(String::as_str).unwrap_or("");
             reply_api(&mut stream, host::stat(path));
+        }
+        ("GET", "/api/exists") => {
+            let path = q.get("path").map(String::as_str).unwrap_or("");
+            reply_api(&mut stream, host::exists(path));
         }
         ("GET", "/api/layout") => reply_json(&mut stream, 200, &host::get_layout()),
         ("PUT", "/api/layout") => match body_json(&req) {
@@ -734,6 +756,16 @@ fn handle(mut stream: TcpStream) {
             fs_viz::shell::touch_ui_pulse();
             reply_json(&mut stream, 200, &json!({ "ok": true }));
         }
+        ("POST", "/api/ime") => match body_json(&req) {
+            Ok(v) => match host::parse_ime_composing(&v) {
+                Ok(composing) => {
+                    fs_viz::shell::set_ime_composing(composing);
+                    reply_json(&mut stream, 200, &json!({ "ok": true }));
+                }
+                Err(e) => reply_json(&mut stream, e.status, &e.body),
+            },
+            Err(e) => reply_json(&mut stream, e.status, &e.body),
+        },
         ("GET", "/api/healthz") => {
             reply_json(&mut stream, 200, &json!({ "ok": true }));
         }
@@ -851,6 +883,11 @@ fn handle(mut stream: TcpStream) {
             },
             Err(e) => reply_json(&mut stream, e.status, &e.body),
         },
+        ("POST", "/api/agent-out/write") => match body_json(&req) {
+            Ok(v) => reply_api(&mut stream, host::agent_out_write(&v)),
+            Err(e) => reply_json(&mut stream, e.status, &e.body),
+        },
+        ("POST", "/api/agent-out/sweep") => reply_api(&mut stream, host::sweep_agent_caps()),
         ("GET", "/api/inspect") => {
             let path = q.get("path").map(String::as_str).unwrap_or("");
             reply_api(&mut stream, host::inspect(path));
@@ -907,7 +944,20 @@ fn handle(mut stream: TcpStream) {
             },
             Err(e) => reply_json(&mut stream, e.status, &e.body),
         },
-        ("POST", "/api/rebuild-ui") => reply_api(&mut stream, host::rebuild_ui()),
+        ("POST", "/api/rebuild-ui") => {
+            let parsed = if req.body.is_empty() {
+                Ok(json!({}))
+            } else {
+                body_json(&req)
+            };
+            match parsed {
+                Ok(v) => match host::parse_rebuild_features(&v) {
+                    Ok(features) => reply_api(&mut stream, host::rebuild_ui(&features)),
+                    Err(e) => reply_json(&mut stream, e.status, &e.body),
+                },
+                Err(e) => reply_json(&mut stream, e.status, &e.body),
+            }
+        }
         ("POST", "/api/open-cursor") => reply_api(&mut stream, host::open_cursor()),
         ("POST", "/api/workspace") => match body_json(&req) {
             Ok(v) => {
@@ -1085,13 +1135,11 @@ fn main() {
         let _ = fs_viz::shell::wait_http(Duration::from_secs(
             fs_viz::shell::DESKTOP_HTTP_WAIT_SECS,
         ));
-        let url = if cli.desktop {
-            fs_viz::shell::desktop_url()
-        } else if let Some(p) = cli.open.as_deref() {
-            fs_viz::shell::folder_url(std::path::Path::new(p))
-        } else {
-            format!("http://{BIND}/")
-        };
+        let url = fs_viz::shell::native_window_url(
+            cli.desktop,
+            cli.open.as_deref().map(Path::new),
+            fs_viz::shell::load_mode().mode,
+        );
         if let Err(e) = fs_viz::shell::open_webview_url(&url) {
             eprintln!("fs-viz native window: {e} — open {url} in a browser");
         }

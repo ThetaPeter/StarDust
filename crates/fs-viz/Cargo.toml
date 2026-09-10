@@ -9,6 +9,9 @@ default-run = "fs-viz"
 [features]
 default = []
 python = ["stardust/python"]
+llvm = ["stardust/llvm"]
+haskell = ["stardust/haskell"]
+lean = ["stardust/lean"]
 
 [dependencies]
 stardust = { path = "../.." }

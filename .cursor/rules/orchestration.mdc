@@ -18,7 +18,7 @@ Core principle: minimize orchestrator context. Delegate anything a subagent can 
 
 While any subagent is running (especially background / long jobs), **check progress regularly** with cheap file signals. Default cadence is about **every 10 minutes**; choose a shorter or longer period when the I/O/B expected runtime clearly warrants it (e.g. a **1-minute** grep/search vs a 45-minute implement+test).
 
-**No sleep-timer terminals.** Do **not** launch `Start-Sleep`, `timeout`, or `ping`-wait reminder shells, and do not `AwaitShell` a long sleep to “check later.” On this Windows host those reminder terminals pile up, fill Cursor’s shell pool, and then **even `echo` / `cargo test` never return** — the timer looks permanently stuck. `Stop-Process` cancel is unreliable once the pool is wedged. **End the turn** so completion notifications (`turn_ended`) arrive; that is the wait. Mid-flight in the same turn: Glob/Read `LastWriteTime` on files the contract says will change. Do not start a new shell to sleep.
+Waiting is allowed: `AwaitShell`, `Start-Sleep`, `timeout`, or a short poll when the **next step is blocked** on a command you started. Ending the turn so `turn_ended` completion notifications arrive is also fine. Mid-flight in the same turn, prefer Glob/Read `LastWriteTime` on the files the contract says will change when that is cheaper than blocking.
 
 **Cheap progress signals (no context bloat):** check `LastWriteTime` on the files the contract says will change, plus the process list (name / start time / CPU) only if a shell is already healthy. Do not read subagent transcripts or large outputs for routine checks — transcripts only record messages, not tool activity, and can look idle while the subagent works.
 

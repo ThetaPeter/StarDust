@@ -1,8 +1,8 @@
-"""Derive stardust.ico + web/luna-icon.png from luna-silhouette.png.
+"""Derive stardust.ico, stardust-caption.ico, and web/luna-icon.png from luna-silhouette.png.
 
 Source PNG pixels are not recolored. Near-white / paper is knockout
-(transparent). Remaining ink coverage is white (#FFFFFF). No plate, no fill,
-no rounded square.
+(transparent). Taskbar/PE ink is white (#FFFFFF). Windows UI caption ink stays
+black. No plate, no fill, no rounded square.
 """
 import struct
 from io import BytesIO
@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 PNG_PATH = ROOT / "luna-silhouette.png"
 ICO_PATH = HERE / "stardust.ico"
+CAPTION_ICO_PATH = HERE / "stardust-caption.ico"
 FAVICON_PATH = ROOT / "crates" / "fs-viz" / "web" / "luna-icon.png"
 
 
@@ -52,6 +53,59 @@ def knockout_and_whiten(im: Image.Image) -> Image.Image:
         return im
 
 
+def knockout_keep_black(im: Image.Image) -> Image.Image:
+    """Paper → transparent; remaining darkness stays black coverage."""
+    im = im.convert("RGBA")
+    try:
+        import numpy as np
+
+        arr = np.array(im)
+        r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+        paper = (r > NEAR_WHITE) & (g > NEAR_WHITE) & (b > NEAR_WHITE)
+        ink = 255 - ((r.astype(np.uint16) + g + b) // 3)
+        na = (ink.astype(np.uint16) * a) // 255
+        na = np.where(paper, 0, na).astype(np.uint8)
+        out = np.empty_like(arr)
+        out[:, :, 0] = 0
+        out[:, :, 1] = 0
+        out[:, :, 2] = 0
+        out[:, :, 3] = na
+        return Image.fromarray(out)
+    except ImportError:
+        px = im.load()
+        w, h = im.size
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = px[x, y]
+                if r > NEAR_WHITE and g > NEAR_WHITE and b > NEAR_WHITE:
+                    px[x, y] = (0, 0, 0, 0)
+                else:
+                    ink = 255 - ((r + g + b) // 3)
+                    px[x, y] = (0, 0, 0, (ink * a) // 255)
+        return im
+
+
+def force_black_rgb(im: Image.Image) -> Image.Image:
+    """After LANCZOS, keep alpha; RGB stays #000000."""
+    im = im.convert("RGBA")
+    try:
+        import numpy as np
+
+        arr = np.array(im)
+        arr[:, :, 0] = 0
+        arr[:, :, 1] = 0
+        arr[:, :, 2] = 0
+        return Image.fromarray(arr)
+    except ImportError:
+        px = im.load()
+        w, h = im.size
+        for y in range(h):
+            for x in range(w):
+                _, _, _, a = px[x, y]
+                px[x, y] = (0, 0, 0, a)
+        return im
+
+
 def force_white_rgb(im: Image.Image) -> Image.Image:
     """After LANCZOS, keep alpha; RGB stays #FFFFFF (no gray fringe fill)."""
     im = im.convert("RGBA")
@@ -73,8 +127,9 @@ def force_white_rgb(im: Image.Image) -> Image.Image:
         return im
 
 
-def sized(art: Image.Image, size: int) -> Image.Image:
-    return force_white_rgb(art.resize((size, size), Image.Resampling.LANCZOS))
+def sized(art: Image.Image, size: int, black: bool = False) -> Image.Image:
+    resized = art.resize((size, size), Image.Resampling.LANCZOS)
+    return force_black_rgb(resized) if black else force_white_rgb(resized)
 
 
 def png_payload(im: Image.Image) -> bytes:
@@ -151,6 +206,19 @@ def main() -> None:
         raise SystemExit(f"256px still has plate/ink: {b256}")
     if b256["white"] < 1000 or b256["trans"] < 1000:
         raise SystemExit(f"256px not white-on-transparent: {b256}")
+
+    cap_src = knockout_keep_black(Image.open(PNG_PATH))
+    cap_frames = [sized(cap_src, s, black=True) for s in SIZES]
+    write_png_ico(CAPTION_ICO_PATH, cap_frames)
+    print(
+        f"wrote {CAPTION_ICO_PATH} frames={len(cap_frames)} "
+        f"sizes={list(SIZES)} bytes={CAPTION_ICO_PATH.stat().st_size}"
+    )
+    cap256 = buckets(cap_frames[-1])
+    if cap256["cream"] or cap256["white"]:
+        raise SystemExit(f"caption 256px still has plate/white: {cap256}")
+    if cap256["black"] < 1000 or cap256["trans"] < 1000:
+        raise SystemExit(f"caption 256px not black-on-transparent: {cap256}")
 
 
 if __name__ == "__main__":

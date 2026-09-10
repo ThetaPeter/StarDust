@@ -22,14 +22,6 @@
   <header id="topbar">
     <nav id="menu" class="menubar">
       <div class="menu">
-        <button type="button" class="menu-btn" data-menu="file">File</button>
-        <div class="menu-pop" id="menu-file" hidden>
-          <button type="button" data-cmd="open-folder">Open folder…<span class="accel">Ctrl+O</span></button>
-          <button type="button" data-cmd="open-desktop">Desktop<span class="accel">Ctrl+D</span></button>
-          <button type="button" data-cmd="open-this-pc">This PC<span class="accel">Ctrl+Shift+P</span></button>
-        </div>
-      </div>
-      <div class="menu">
         <button type="button" class="menu-btn" data-menu="edit">Edit</button>
         <div class="menu-pop" id="menu-edit" hidden>
           <button type="button" data-cmd="cut" data-need-sel>Cut<span class="accel">Ctrl+X</span></button>
@@ -61,8 +53,6 @@
             </div>
           </div>
           <button type="button" data-cmd="galaxy">Galaxy</button>
-          <hr/>
-          <button type="button" id="btn-ui-mode" data-cmd="toggle-ui-mode" title="Switch StarDust UI / Windows UI">StarDust UI</button>
         </div>
       </div>
       <div class="menu">
@@ -71,18 +61,24 @@
           <button type="button" data-cmd="cargo-test">cargo test</button>
           <button type="button" data-cmd="open-cursor">Open in Cursor</button>
           <button type="button" data-cmd="refresh-web">Refresh web<span class="accel">Ctrl+F5</span></button>
-          <hr/>
-          <button type="button" data-cmd="rebuild-ui">Rebuild StarDust UI</button>
-        </div>
-      </div>
-      <div class="menu">
-        <button type="button" class="menu-btn" data-menu="help">Help</button>
-        <div class="menu-pop" id="menu-help" hidden>
           <button type="button" data-cmd="keyboard-shortcuts">Keyboard shortcuts<span class="accel">Ctrl+/</span></button>
-          <button type="button" data-cmd="about">About</button>
+          <hr/>
+          <div class="submenu">
+            <button type="button" class="submenu-btn" data-cmd="rebuild-ui">Rebuild StarDust UI</button>
+            <div class="menu-pop nested">
+              <button type="button" data-cmd="rebuild-ui-python">Rebuild with Python</button>
+              <button type="button" data-cmd="rebuild-ui-llvm">Rebuild with LLVM</button>
+              <button type="button" data-cmd="rebuild-ui-haskell">Rebuild with Haskell</button>
+              <button type="button" data-cmd="rebuild-ui-lean">Rebuild with Lean</button>
+            </div>
+          </div>
         </div>
       </div>
     </nav>
+    <button type="button" id="brand" data-cmd="toggle-ui-mode" title="Switch to StarDust UI" aria-label="Switch to StarDust UI">
+      <img src="/web/luna-icon.png" width="18" height="18" alt="" draggable="false"/>
+      <span id="brand-wordmark">StarDust</span>
+    </button>
     <div id="search">
       <input id="search-input" type="search" placeholder="Search files and folders" autocomplete="off" spellcheck="false"/>
       <div id="search-drop" class="menu-pop search-drop" hidden></div>
@@ -97,7 +93,11 @@
     <div id="agent-sash" title="Resize agent"></div>
     <aside id="agent">
       <header class="agent-head">
-        <button type="button" id="agent-toggle" class="icon-btn" title="Collapse agent">▸</button>
+        <button type="button" id="agent-toggle" class="icon-btn" title="Collapse agent" aria-label="Collapse agent">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path d="M6 3.2 11 8 6 12.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
         <div id="agent-tabs" role="tablist" aria-label="Agent threads"></div>
         <button type="button" id="agent-new" class="icon-btn" title="New thread">+</button>
         <div class="agent-head-right">
@@ -110,18 +110,6 @@
             </button>
             <div id="agent-history-pop" class="menu-pop agent-pop" hidden>
               <ul id="thread-list"></ul>
-            </div>
-          </div>
-          <div class="agent-pop-wrap">
-            <button type="button" id="agent-rules-btn" class="icon-btn" title="Rules" aria-label="Rules">
-              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-                <path d="M5 2.5h4.2L12.5 6v7.5H5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
-                <path d="M9.2 2.5V6H12.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
-                <path d="M6.5 8.2h3.2M6.5 10.6h3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-              </svg>
-            </button>
-            <div id="agent-rules-pop" class="menu-pop agent-pop" hidden>
-              <textarea id="agent-rules" rows="6" placeholder="Applied on every send. Leave empty for none."></textarea>
             </div>
           </div>
         </div>
@@ -156,7 +144,11 @@
       </div>
     </aside>
   </div>
-  <button type="button" id="agent-strip" hidden title="Open agent" aria-label="Open agent"><span class="agent-tab-tri"></span></button>
+  <button type="button" id="agent-strip" hidden title="Open agent" aria-label="Open agent">
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path d="M10 3.2 5 8 10 12.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </button>
   <div id="status-strip" title="Failsafe: Ctrl+Shift+F12 restores Windows Explorer">
     <span id="status-health" class="health-dot" title="UI health"></span>
     <span id="status-text">Ready</span>
@@ -175,7 +167,7 @@
 <div id="shortcut-overlay" hidden>
   <div class="shortcut-card" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
     <h2 id="shortcut-title">Keyboard shortcuts</h2>
-    <p class="shortcut-hint">Esc closes · Ctrl+/ or F1 toggles · Help → Keyboard shortcuts</p>
+    <p class="shortcut-hint">Esc closes · Ctrl+/ or F1 toggles · Tools → Keyboard shortcuts</p>
     <div class="shortcut-groups">
       <section>
         <h3>Navigation</h3>
@@ -206,9 +198,6 @@
           <dt>Ctrl+S</dt><dd>Save focused editor</dd>
           <dt>F2</dt><dd>Rename</dd>
           <dt>Delete</dt><dd>Recycle Bin / Trash</dd>
-          <dt>Ctrl+O</dt><dd>Open folder…</dd>
-          <dt>Ctrl+D</dt><dd>Desktop</dd>
-          <dt>Ctrl+Shift+P</dt><dd>This PC</dd>
           <dt>Ctrl+Shift+N</dt><dd>New folder</dd>
           <dt>Alt+Enter</dt><dd>Properties</dd>
         </dl>

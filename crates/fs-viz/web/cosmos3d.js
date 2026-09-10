@@ -191,6 +191,7 @@
       },
       highlight() {},
       highlightParent() {},
+      previewSelection() {},
       selectNames() {},
       getSelection() {
         return [];
@@ -365,6 +366,7 @@
         frozen: {},
         arranged: false,
         sel: new Set(),
+        searchSel: new Set(),
         anchor: null,
         hover: null,
         highlight: null,
@@ -599,21 +601,23 @@
         else if (key === "size") items.sort((a, b) => (b.size || 0) - (a.size || 0));
         const n = items.length;
         if (!n) return;
-        if (n <= 14) {
-          const r = 48 + n * 8;
-          items.forEach((s, i) => {
-            const a = (i / n) * Math.PI * 2 - Math.PI / 2;
-            s.x = Math.cos(a) * r;
-            s.y = Math.sin(a) * r;
-            s.z = s.kind === "dir" ? 12 : 0;
-          });
-        } else {
-          items.forEach((s, i) => {
-            s.x = (i - (n - 1) / 2) * 46;
-            s.y = i % 2 === 0 ? -16 : 16;
-            s.z = s.kind === "dir" ? 12 : 0;
-          });
-        }
+        const cellW = 56;
+        const cellH = 48;
+        const viewW = Math.max(1, self.w || 480);
+        const dist = Math.max(80, orbit.r || 420);
+        const vFov = ((camera && camera.fov ? camera.fov : 50) * Math.PI) / 180;
+        const worldH = 2 * dist * Math.tan(vFov / 2);
+        const worldW = worldH * (viewW / Math.max(1, self.h || 320));
+        const fitCols = Math.max(1, Math.floor((worldW * 0.84) / cellW));
+        const cols = Math.max(1, Math.min(n, fitCols));
+        const rows = Math.ceil(n / cols);
+        const x0 = (orbit.tx || 0) - ((cols - 1) * cellW) / 2;
+        const y0 = (orbit.tz || 0) - ((rows - 1) * cellH) / 2;
+        items.forEach((s, i) => {
+          s.x = x0 + (i % cols) * cellW;
+          s.y = y0 + Math.floor(i / cols) * cellH;
+          s.z = s.kind === "dir" ? 12 : 0;
+        });
         self.arranged = true;
         rebuild();
       }
@@ -659,6 +663,34 @@
       function announceSel() {
         if (h.onSelect)
           h.onSelect([...self.sel].map((n) => self.stars.find((s) => s.name === n)).filter(Boolean));
+      }
+
+      function applyModClick(s, e) {
+        if (!s) return;
+        if (e.shiftKey && self.anchor) {
+          const pa = sprites.find((x) => x.star === self.anchor);
+          const pb = sprites.find((x) => x.star === s);
+          if (pa && pb) {
+            const sa = project(pa.obj.position);
+            const sb = project(pb.obj.position);
+            const minx = Math.min(sa.x, sb.x);
+            const maxx = Math.max(sa.x, sb.x);
+            const miny = Math.min(sa.y, sb.y);
+            const maxy = Math.max(sa.y, sb.y);
+            sprites.forEach((sp) => {
+              const p = project(sp.obj.position);
+              if (p.x >= minx && p.x <= maxx && p.y >= miny && p.y <= maxy) {
+                self.sel.add(sp.star.name);
+              }
+            });
+          }
+        } else if (self.sel.has(s.name)) {
+          self.sel.delete(s.name);
+        } else {
+          self.sel.add(s.name);
+        }
+        self.anchor = s;
+        announceSel();
       }
 
       let flyGen = 0;
@@ -933,6 +965,13 @@
           star: s,
           lx: e.clientX,
           ly: e.clientY,
+          px: e.clientX,
+          py: e.clientY,
+          grabX: s ? s.x : 0,
+          grabY: s ? s.y : 0,
+          grabZ: s ? s.z || 0 : 0,
+          lastClient: { x: e.clientX, y: e.clientY },
+          ghost: null,
           moved: false,
           sx: e.clientX - r.left,
           sy: e.clientY - r.top,
@@ -959,46 +998,99 @@
         }
         if (self.drag.kind === "orbit") orbit3d(dx, dy);
         else if (self.drag.kind === "pan") pan3d(dx, dy);
-        else if (self.drag.kind === "star" && self.drag.star) {
-          moveGrabbedStar(self.drag.star, dx, dy, e);
+        else if (self.drag.kind === "star") {
+          moveStarFromGrab(e);
         } else if (self.drag.kind === "marquee") {
           setMarquee(self.drag.sx, self.drag.sy, self.mouse.x, self.mouse.y);
         }
-        self.drag.lx = e.clientX;
-        self.drag.ly = e.clientY;
+        if (self.drag.kind !== "star") {
+          self.drag.lx = e.clientX;
+          self.drag.ly = e.clientY;
+        }
       });
 
+      function pointerInContainer(cx, cy) {
+        const r = container.getBoundingClientRect();
+        return cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+      }
+
+      function eventAt(e, d) {
+        const fallback = d && d.lastClient;
+        const invalid = !e || ((e.clientX === 0 && e.clientY === 0) && fallback);
+        return {
+          clientX: invalid ? fallback.x : e.clientX,
+          clientY: invalid ? fallback.y : e.clientY,
+          button: e && typeof e.button === "number" ? e.button : 0,
+          pointerId: e && e.pointerId,
+          ctrlKey: !!(e && e.ctrlKey),
+          metaKey: !!(e && e.metaKey),
+          shiftKey: !!(e && e.shiftKey),
+        };
+      }
+
+      function setStarSpriteVisible(star, on) {
+        const sp = sprites.find((x) => x.star === star);
+        if (sp && sp.obj) sp.obj.visible = on;
+      }
+
+      function hideStarGhost() {
+        if (window.SDStarDrag) window.SDStarDrag.hide();
+      }
+
+      function moveStarFromGrab(e) {
+        const d = self.drag;
+        if (!d || d.kind !== "star" || !d.star) return;
+        d.lastClient = { x: e.clientX, y: e.clientY };
+        if (Math.hypot(e.clientX - d.px, e.clientY - d.py) > 3) d.moved = true;
+        if (pointerInContainer(e.clientX, e.clientY)) {
+          const st = d.star;
+          st.x = d.grabX;
+          st.y = d.grabY;
+          st.z = d.grabZ;
+          const sp = sprites.find((x) => x.star === st);
+          if (sp) sp.obj.position.set(st.x, st.z || 0, st.y);
+          moveGrabbedStar(st, e.clientX - d.px, e.clientY - d.py, e);
+        }
+        if (d.moved && window.SDStarDrag) {
+          setStarSpriteVisible(d.star, false);
+          if (!d.ghost) d.ghost = window.SDStarDrag.capture(d.star, d.star.kind === "dir" ? 16 : 12);
+          window.SDStarDrag.show(d.ghost, e.clientX, e.clientY);
+        }
+      }
+
       function endDrag(e) {
-        if (!self.live) return;
         if (!self.drag) return;
         const d = self.drag;
+        const ev = eventAt(e, d);
         self.drag = null;
         hideMarquee();
+        hideStarGhost();
+        if (d.star) setStarSpriteVisible(d.star, true);
         try {
-          container.releasePointerCapture(e.pointerId);
+          container.releasePointerCapture(ev.pointerId);
         } catch (_) {}
         if (
-          e.button === 0 &&
+          ev.button === 0 &&
           !d.moved &&
           d.kind !== "dblpan" &&
           d.kind !== "nav" &&
           d.kind !== "pan" &&
           d.kind !== "orbit"
         ) {
-          self.lastClick = { t: performance.now(), x: e.clientX, y: e.clientY };
+          self.lastClick = { t: performance.now(), x: ev.clientX, y: ev.clientY };
         } else {
           self.lastClick = null;
         }
         if (d.kind === "star" && d.moved) {
-          if (!self.arranged) emitPos();
-          if (h.onStarDragEnd) h.onStarDragEnd(d.star, e);
+          const fileMove = h.onStarDragEnd ? h.onStarDragEnd(d.star, ev) : false;
+          if (!self.arranged && !fileMove) emitPos();
           return;
         }
         if (d.kind === "pan" || d.kind === "orbit") return;
         if (d.kind === "marquee") {
           const r = container.getBoundingClientRect();
-          const x1 = e.clientX - r.left;
-          const y1 = e.clientY - r.top;
+          const x1 = ev.clientX - r.left;
+          const y1 = ev.clientY - r.top;
           const minx = Math.min(d.sx, x1);
           const maxx = Math.max(d.sx, x1);
           const miny = Math.min(d.sy, y1);
@@ -1009,7 +1101,7 @@
               return p.vis && p.x >= minx && p.x <= maxx && p.y >= miny && p.y <= maxy;
             })
             .map((sp) => sp.star);
-          const add = e.ctrlKey || e.metaKey || e.shiftKey;
+          const add = ev.ctrlKey || ev.metaKey || ev.shiftKey;
           if (!hits.length) {
             if (!add) {
               self.sel.clear();
@@ -1025,10 +1117,8 @@
           return;
         }
         if (d.moved) return;
-        if (d.kind === "nav" || isNav(e)) {
-          const t = d.star || hit(e.clientX, e.clientY);
-          if (t && t.kind === "dir") enterStar(t);
-          else if (!t) leaveScene();
+        if (d.kind === "nav" || isNav(ev)) {
+          applyModClick(d.star || hit(ev.clientX, ev.clientY), ev);
           return;
         }
         const s = d.star;
@@ -1038,7 +1128,7 @@
           announceSel();
           return;
         }
-        if (e.shiftKey && self.anchor) {
+        if (ev.shiftKey && self.anchor) {
           const pa = sprites.find((x) => x.star === self.anchor);
           const pb = sprites.find((x) => x.star === s);
           if (pa && pb) {
@@ -1064,11 +1154,27 @@
         announceSel();
       }
 
+      function onWinStarPointer(e) {
+        if (!self.live || self.dead) return;
+        if (self.drag && self.drag.kind === "star") moveStarFromGrab(e);
+      }
+
       container.addEventListener("pointerup", endDrag);
-      container.addEventListener("pointercancel", () => {
+      container.addEventListener("pointercancel", (e) => {
         if (!self.live) return;
-        hideMarquee();
-        self.drag = null;
+        if (self.drag && self.drag.kind === "star") endDrag(e);
+        else {
+          hideMarquee();
+          hideStarGhost();
+          self.drag = null;
+        }
+      });
+      window.addEventListener("pointermove", onWinStarPointer);
+      window.addEventListener("pointerup", (e) => {
+        if (self.live && self.drag) endDrag(e);
+      });
+      window.addEventListener("pointercancel", (e) => {
+        if (self.live && self.drag && self.drag.kind === "star") endDrag(e);
       });
       container.addEventListener("dblclick", (e) => {
         if (!self.live || self.dead) return;
@@ -1125,8 +1231,11 @@
           sp.lab.style.left = p.x + "px";
           sp.lab.style.top = p.y + "px";
           const on =
-            self.highlight === sp.star.name || self.sel.has(sp.star.name) || self.hover === sp.star;
-          sp.lab.classList.toggle("sel", self.sel.has(sp.star.name));
+            self.highlight === sp.star.name ||
+            self.sel.has(sp.star.name) ||
+            self.searchSel.has(sp.star.name) ||
+            self.hover === sp.star;
+          sp.lab.classList.toggle("sel", self.sel.has(sp.star.name) || self.searchSel.has(sp.star.name));
           if (isCnsWord(sp.star) && !cnsLabelsOpen && !on) {
             sp.lab.style.opacity = "0";
             return;
@@ -1138,7 +1247,10 @@
             if (d < 150) op = Math.min(1, op + (1 - d / 150) * 0.7);
           }
           sp.lab.style.opacity = String(op);
-          sp.lab.style.color = self.sel.has(sp.star.name) ? "rgba(255, 232, 208, 0.95)" : "";
+          sp.lab.style.color =
+            self.sel.has(sp.star.name) || self.searchSel.has(sp.star.name)
+              ? "rgba(255, 232, 208, 0.95)"
+              : "";
         });
       }
 
@@ -1149,7 +1261,7 @@
         const Look = window.SDLook;
         sprites.forEach((sp) => {
           const st = sp.star;
-          const selected = self.sel.has(st.name);
+          const selected = self.sel.has(st.name) || self.searchSel.has(st.name);
           const on = self.hover === st || self.highlight === st.name || selected;
           const phase = st.twinkle0 || 0;
           let k = 1;
@@ -1236,6 +1348,9 @@
           const s = self.stars.find((x) => x.path === parentPath);
           self.highlight = s ? s.name : null;
         },
+        previewSelection(names) {
+          self.searchSel = new Set(names || []);
+        },
         selectNames(names) {
           self.sel = new Set(names || []);
           announceSel();
@@ -1283,6 +1398,7 @@
           if (!self.live) {
             self.drag = null;
             hideMarquee();
+            hideStarGhost();
           }
         },
         domElement: renderer.domElement,

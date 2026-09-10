@@ -5,8 +5,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,7 +39,12 @@ const HOST_DESKTOP_ARG: &str = "--desktop";
 /// `CREATE_NO_WINDOW` — no taskbar console for helper `Command`s.
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Do not allocate a console window for this child (node, taskkill, where, netstat, cmd, fs-viz, guard, view).
+/// Hide the helper console and do not inherit std handles.
+///
+/// `--desktop` / `--open` / `--headless` call `FreeConsole`, so inherited
+/// stdin/stdout/stderr are invalid. `CreateProcess` then fails with
+/// `ERROR_INVALID_HANDLE` (os error 6, 控制代碼無效). Callers that capture
+/// output must set `Stdio::piped` **after** this.
 pub fn windows_no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
@@ -45,8 +53,11 @@ pub fn windows_no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     {
-        let _ = (cmd, CREATE_NO_WINDOW);
+        let _ = CREATE_NO_WINDOW;
     }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 }
 
 fn spawn_no_window(cmd: &mut Command) -> io::Result<std::process::Child> {
@@ -586,6 +597,179 @@ pub fn shell_gui_params(folder: &Path, extra: &[&str]) -> String {
     param
 }
 
+/// StarDust repo folder (`crates/fs-viz` → workspace). Same root Tools → Rebuild uses.
+pub fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn is_cursor_gui(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n.eq_ignore_ascii_case("Cursor.exe"))
+            .unwrap_or(false)
+}
+
+fn cursor_exe_beside(path: &Path) -> Option<PathBuf> {
+    let mut dir = path.parent()?;
+    for _ in 0..4 {
+        let cand = dir.join("Cursor.exe");
+        if is_cursor_gui(&cand) {
+            return Some(cand);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// `Cursor.exe` GUI (not `cursor.cmd`). Typical `%LOCALAPPDATA%\Programs\cursor\Cursor.exe`.
+pub fn find_cursor_exe() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let typical = PathBuf::from(local)
+                .join("Programs")
+                .join("cursor")
+                .join("Cursor.exe");
+            if is_cursor_gui(&typical) {
+                return Some(typical);
+            }
+        }
+        for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(root) = std::env::var(key) {
+                let cand = PathBuf::from(root).join("cursor").join("Cursor.exe");
+                if is_cursor_gui(&cand) {
+                    return Some(cand);
+                }
+            }
+        }
+        for root in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+            let cand = PathBuf::from(root).join("cursor").join("Cursor.exe");
+            if is_cursor_gui(&cand) {
+                return Some(cand);
+            }
+        }
+        for arg in ["Cursor.exe", "cursor"] {
+            let mut cmd = Command::new("where");
+            cmd.arg(arg);
+            windows_no_window(&mut cmd);
+            let Ok(out) = cmd.output() else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let p = PathBuf::from(line.trim());
+                if p.as_os_str().is_empty() {
+                    continue;
+                }
+                if is_cursor_gui(&p) {
+                    return Some(p);
+                }
+                if let Some(gui) = cursor_exe_beside(&p) {
+                    return Some(gui);
+                }
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let p = dir.join("Cursor.exe");
+                if is_cursor_gui(&p) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("which").arg("cursor").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        let p = PathBuf::from(line.lines().next().unwrap_or("").trim());
+        p.is_file().then_some(p)
+    }
+}
+
+/// `ShellExecuteW` `Cursor.exe --classic --new-window "<folder>"` (not `CREATE_NO_WINDOW`).
+pub fn open_cursor_gui() -> io::Result<()> {
+    let cwd = workspace_root();
+    if !cwd.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "workspace root missing",
+        ));
+    }
+    let exe = find_cursor_exe().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "Cursor.exe not found")
+    })?;
+    shell_open_gui(&exe, &cwd, &["--classic", "--new-window"])
+}
+
+const OPEN_CURSOR_YIELD: Duration = Duration::from_secs(4);
+static OPEN_CURSOR_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Cover z-order yield after a view-thread Open in Cursor launch.
+pub fn note_opening_cursor() {
+    if let Ok(mut g) = OPEN_CURSOR_UNTIL.lock() {
+        *g = Some(Instant::now() + OPEN_CURSOR_YIELD);
+    }
+}
+
+/// True until the Open-in-Cursor yield deadline; clears when it passes.
+pub fn opening_cursor() -> bool {
+    let Ok(mut g) = OPEN_CURSOR_UNTIL.lock() else {
+        return false;
+    };
+    match *g {
+        Some(deadline) if Instant::now() < deadline => true,
+        Some(_) => {
+            *g = None;
+            false
+        }
+        None => false,
+    }
+}
+
+/// Registered `StarDustOpenCursor` (same atom in `fs-viz` HTTP and `stardust-view`).
+pub fn wm_open_cursor() -> u32 {
+    #[cfg(windows)]
+    {
+        static SLOT: OnceLock<u32> = OnceLock::new();
+        return *SLOT.get_or_init(|| {
+            let name = wide("StarDustOpenCursor");
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(name.as_ptr()) }
+        });
+    }
+    #[cfg(not(windows))]
+    0
+}
+
+/// `PostMessage` Open in Cursor to `StarDustHost`. Does not `HWND_TOP` the cover.
+pub fn post_open_cursor() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        return desktop_cover::post_open_cursor_message(wm_open_cursor()).map_err(|e| e.to_string());
+    }
+    #[cfg(not(windows))]
+    Err("no StarDustHost".into())
+}
+
+/// View-thread launch: ShellExecute then yield cover z-order ~4s.
+pub fn open_cursor_from_view() {
+    if open_cursor_gui().is_ok() {
+        note_opening_cursor();
+    }
+}
+
 /// Launch a GUI exe with extra flags then one path argument (no `CREATE_NO_WINDOW` — that hides Electron).
 pub fn shell_open_gui(exe: &Path, arg: &Path, extra: &[&str]) -> io::Result<()> {
     #[cfg(windows)]
@@ -680,10 +864,18 @@ pub fn start_host_desktop() -> io::Result<()> {
     Ok(())
 }
 
-pub fn restart_host() {
-    if in_rebuild_hold_at(&load_mode(), unix_now()) {
+/// `true` if StarDust mode should relaunch `--desktop` (cover), not `--headless`.
+fn restart_host_uses_desktop_cover(mode: &UiModeFile) -> bool {
+    mode.mode == UiMode::Stardust
+}
+
+/// Kill and relaunch the host. Returns `true` if a restart was attempted.
+/// Rebuild hold: return `false` without `taskkill` — callers must not treat that as a failed restart.
+pub fn restart_host() -> bool {
+    let mode = load_mode();
+    if in_rebuild_hold_at(&mode, unix_now()) {
         append_log("restart-host-skipped-rebuild-hold");
-        return;
+        return false;
     }
     append_log("restart-host");
     #[cfg(windows)]
@@ -694,8 +886,13 @@ pub fn restart_host() {
         let _ = kill.status();
         std::thread::sleep(Duration::from_millis(400));
     }
-    let _ = start_host_headless();
-    let _ = wait_http(OPEN_TIMEOUT);
+    if restart_host_uses_desktop_cover(&mode) {
+        let _ = start_host_desktop();
+    } else {
+        let _ = start_host_headless();
+    }
+    let _ = wait_http(Duration::from_secs(BOOT_GRACE_SECS));
+    true
 }
 
 /// StarDust replace-armed: never ShellExecute `explore` / `explorer.exe`.
@@ -823,9 +1020,8 @@ pub fn trampoline_main(args: &[String]) {
 }
 
 pub fn probe() -> HealthFile {
-    let mut mode = load_mode();
+    let mode = load_mode();
     let server_ok = http_ok();
-    maybe_clear_rebuild_hold(&mut mode, server_ok);
     let heartbeat_ok = file_age_secs(&heartbeat_path(), HEARTBEAT_STALE);
     let ui_pulse_ok = file_age_secs(&ui_pulse_path(), UI_PULSE_STALE);
     let backup_ok = backup_path().is_file() || !mode.replace_armed;
@@ -1025,11 +1221,11 @@ fn in_rebuild_hold_at(mode: &UiModeFile, now: u64) -> bool {
     mode.rebuild_hold_until != 0 && now < mode.rebuild_hold_until
 }
 
-fn maybe_clear_rebuild_hold(mode: &mut UiModeFile, server_ok: bool) {
-    if server_ok && mode.rebuild_hold_until != 0 {
-        mode.rebuild_hold_until = 0;
-        let _ = save_mode(mode);
-    }
+/// Probe used to zero the hold on first `server_ok`, ending the 660s cargo/sleep window.
+/// Hold lasts until `rebuild_hold_until` (`in_rebuild_hold_at`) only. Failover still zeros it.
+#[cfg(test)]
+fn rebuild_hold_until_after_probe(rebuild_hold_until: u64, _server_ok: bool) -> u64 {
+    rebuild_hold_until
 }
 
 fn note_guard_boot() {
@@ -1052,6 +1248,30 @@ fn in_boot_grace_since(started_at: u64, now: u64) -> bool {
 /// arm grace, or rebuild hold. Red (missing-backup, registry-drift, trampoline-timeout) still may.
 fn yellow_host_recovery_blocked(mode: &UiModeFile, boot_at: u64, now: u64) -> bool {
     in_boot_grace_since(boot_at, now) || in_arm_grace_at(mode, now) || in_rebuild_hold_at(mode, now)
+}
+
+/// Yellow ui-pulse-stale / heartbeat-stale: do not taskkill or failover (Edge throttles
+/// page timers; sleep/lid ages the 5s heartbeat). http-down still recovers. Red still may.
+fn yellow_reason_skips_host_restart(reason: &str) -> bool {
+    reason == "ui-pulse-stale" || reason == "heartbeat-stale"
+}
+
+/// Yellow http-down must not restart or failover while another user app is FG
+/// (exclusive fullscreen can hitch the cover). Red / hotkey / tray / open-storm
+/// still may. StarDust / shell / taskbar FG still recovers http-down.
+fn yellow_http_down_skips_for_other_app(reason: &str, other_app_fg: bool) -> bool {
+    reason == "http-down" && other_app_fg
+}
+
+/// After a real restart (or a later yellow tick with `restart_used`): failover only if HTTP
+/// is still down. ui-pulse-stale / heartbeat-stale with `server_ok` must not flip to Windows.
+fn after_restart_should_failover(health: &HealthFile) -> bool {
+    !health.server_ok
+}
+
+/// Rebuild-hold skip is not a failed restart — do not write `after-restart:*`.
+fn after_host_restart_action(restarted: bool, again: &HealthFile) -> bool {
+    restarted && after_restart_should_failover(again)
 }
 
 pub fn guard_tick() {
@@ -1078,7 +1298,7 @@ pub fn guard_tick() {
             let _ = save_mode(&mode);
         }
         #[cfg(windows)]
-        keep_frameless();
+        keep_cover_if_wrong();
     }
     let health = probe();
     write_health(&health);
@@ -1110,19 +1330,31 @@ pub fn guard_tick() {
             let _ = set_desktop_icons_hidden(true);
             return;
         }
-        if health.reason == "ui-pulse-stale" {
+        if yellow_reason_skips_host_restart(&health.reason) {
+            return;
+        }
+        #[cfg(windows)]
+        if yellow_http_down_skips_for_other_app(
+            &health.reason,
+            desktop_cover::other_user_app_is_foreground(),
+        ) {
             return;
         }
         if !mode.restart_used {
             mode.restart_used = true;
             let _ = save_mode(&mode);
-            restart_host();
+            let restarted = restart_host();
+            if !restarted {
+                mode.restart_used = false;
+                let _ = save_mode(&mode);
+                return;
+            }
             let again = probe();
             write_health(&again);
-            if again.color != "green" {
+            if after_host_restart_action(true, &again) {
                 failover_to_windows(&format!("after-restart:{}", again.reason));
             }
-        } else {
+        } else if after_restart_should_failover(&health) {
             failover_to_windows(&health.reason);
         }
         return;
@@ -1676,13 +1908,68 @@ pub fn restore_stardust_cover() {
 }
 
 #[cfg(windows)]
-/// Same as `restore_stardust_cover`, but skip a full `SetWindowPos` when the host
-/// is already a clean work-area popup. Does not pin z-order.
+/// Same as `restore_stardust_cover`, but skip a full restyle when the host is
+/// already a visible work-area popup. If Progman/WorkerW is above, restack
+/// without pinning z-order on neighbor shuffles.
 pub fn restore_stardust_cover_if_wrong() {
     if load_mode().mode != UiMode::Stardust {
         return;
     }
     keep_cover_if_wrong();
+}
+
+#[cfg(windows)]
+pub fn cover_ime_ui_foreground() -> bool {
+    desktop_cover::ime_ui_is_foreground()
+}
+
+#[cfg(windows)]
+pub fn cover_other_user_app_foreground() -> bool {
+    desktop_cover::other_user_app_is_foreground()
+}
+
+/// `WM_POWERBROADCAST` (winuser.h). Not always in this crate's windows-sys features.
+pub const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMRESUMECRITICAL: usize = 0x0006;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+/// True for sleep/lid resume events. Suspend itself is not a restore.
+pub fn is_power_resume(wparam: usize) -> bool {
+    matches!(
+        wparam,
+        PBT_APMRESUMECRITICAL | PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC
+    )
+}
+
+#[cfg(windows)]
+/// True when the desktop cover should ignore min/max/restore `WM_SYSCOMMAND`
+/// (Win+D must not iconify the wallpaper). Windows UI still DefWindowProc.
+pub fn cover_swallow_host_minimize(is_desktop_host: bool, cmd: u32) -> bool {
+    desktop_cover::cover_swallow_minimize(is_desktop_host, cmd)
+}
+
+#[cfg(windows)]
+/// Thread-local `WH_CBT` (`HCBT_MINMAX` only) on the host UI thread.
+pub fn install_cover_cbt_hook() {
+    desktop_cover::install_cover_cbt_hook();
+}
+
+#[cfg(windows)]
+/// `NonRudeHWND` on `StarDustHost` and WebView2 children (before first ShowWindow).
+pub fn apply_cover_non_rude(hwnd: windows_sys::Win32::Foundation::HWND) {
+    desktop_cover::apply_cover_non_rude(hwnd);
+}
+
+#[cfg(windows)]
+/// Same skips as `on_host_shown` restore: composing, IME UI FG, or other-app FG.
+pub fn cover_skip_restore_if_wrong() -> bool {
+    desktop_cover::skip_restore_if_wrong_now()
+}
+
+#[cfg(windows)]
+pub fn uninstall_cover_cbt_hook() {
+    desktop_cover::uninstall_cover_cbt_hook();
 }
 
 #[cfg(windows)]
@@ -1696,6 +1983,65 @@ pub fn pin_stardust_cover_changing(
         return;
     }
     desktop_cover::apply_cover_windowpos_changing(hwnd, lparam);
+}
+
+static IME_COMPOSING: AtomicBool = AtomicBool::new(false);
+
+/// True while JS reports IME/RIME composition (including the 700ms quiet after end).
+/// Named event so `fs-viz` HTTP and `stardust-view` share the flag.
+pub fn ime_composing() -> bool {
+    #[cfg(windows)]
+    {
+        if let Some(h) = ime_event_handle() {
+            const WAIT_OBJECT_0: u32 = 0;
+            let st = unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(h, 0) };
+            return st == WAIT_OBJECT_0;
+        }
+    }
+    IME_COMPOSING.load(Ordering::SeqCst)
+}
+
+pub fn set_ime_composing(composing: bool) {
+    IME_COMPOSING.store(composing, Ordering::SeqCst);
+    #[cfg(windows)]
+    {
+        if let Some(h) = ime_event_handle() {
+            unsafe {
+                if composing {
+                    let _ = windows_sys::Win32::System::Threading::SetEvent(h);
+                } else {
+                    let _ = windows_sys::Win32::System::Threading::ResetEvent(h);
+                }
+            }
+        }
+    }
+}
+
+/// Skip WebView `put_Bounds`, `MoveFocus`, and `ExecuteScript` while composing.
+pub fn ime_blocks_bounds_focus_script(composing: bool) -> bool {
+    composing
+}
+
+#[cfg(windows)]
+fn ime_event_handle() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    static SLOT: OnceLock<isize> = OnceLock::new();
+    let raw = *SLOT.get_or_init(|| {
+        let name = wide("Local\\StarDustImeComposing");
+        let h = unsafe {
+            windows_sys::Win32::System::Threading::CreateEventW(
+                std::ptr::null(),
+                1,
+                0,
+                name.as_ptr(),
+            )
+        };
+        h as isize
+    });
+    if raw == 0 {
+        None
+    } else {
+        Some(raw as windows_sys::Win32::Foundation::HANDLE)
+    }
 }
 
 #[cfg(windows)]
@@ -2023,6 +2369,18 @@ pub fn desktop_url() -> String {
     format!("http://{BIND}/?desktop=1")
 }
 
+/// Native window URL for `--desktop` / `--open PATH`. `--desktop` always wins.
+/// StarDust UI mode keeps `--open` on the work-area cover (`?desktop=1`), not `?open=`.
+pub fn native_window_url(desktop: bool, open: Option<&Path>, mode: UiMode) -> String {
+    if desktop || (open.is_some() && mode == UiMode::Stardust) {
+        desktop_url()
+    } else if let Some(p) = open {
+        folder_url(p)
+    } else {
+        format!("http://{BIND}/")
+    }
+}
+
 pub fn guard_main() {
     enable_dpi_aware();
     let _ = ensure_config_dir();
@@ -2166,6 +2524,64 @@ fn load_stardust_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
         ICON.store(h as isize, Ordering::Release);
     });
     ICON.load(Ordering::Acquire) as _
+}
+
+/// Black luna for the light Windows UI caption. Not the PE / taskbar mark.
+#[cfg(windows)]
+fn load_caption_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::Once;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+
+    static ONCE: Once = Once::new();
+    static ICON: AtomicIsize = AtomicIsize::new(0);
+    ONCE.call_once(|| {
+        let mut h = std::ptr::null_mut();
+        let mut buf = [0u16; 1024];
+        let n = unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) };
+        if n > 0 && (n as usize) < buf.len() {
+            let exe = String::from_utf16_lossy(&buf[..n as usize]);
+            if let Some(dir) = Path::new(&exe).parent() {
+                h = load_icon_from(&dir.join("stardust-caption.ico"));
+            }
+        }
+        if h.is_null() {
+            h = load_icon_from(
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets")
+                    .join("stardust-caption.ico"),
+            );
+        }
+        ICON.store(h as isize, Ordering::Release);
+    });
+    ICON.load(Ordering::Acquire) as _
+}
+
+/// ICON_BIG stays white (taskbar / PE). Floated Windows UI uses black ICON_SMALL.
+#[cfg(windows)]
+pub fn apply_host_window_icons(hwnd: windows_sys::Win32::Foundation::HWND, floated: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON};
+    let big = load_stardust_icon();
+    if !big.is_null() {
+        unsafe {
+            let _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
+        }
+    }
+    let small = if floated {
+        let cap = load_caption_icon();
+        if cap.is_null() {
+            big
+        } else {
+            cap
+        }
+    } else {
+        big
+    };
+    if !small.is_null() {
+        unsafe {
+            let _ = SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2393,6 +2809,31 @@ mod tests {
     }
 
     #[test]
+    fn caption_icon_is_not_the_pe_mark() {
+        let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let pe = assets.join("stardust.ico");
+        let cap = assets.join("stardust-caption.ico");
+        assert!(pe.is_file());
+        assert!(cap.is_file());
+        assert_ne!(pe.file_name(), cap.file_name());
+    }
+
+    #[test]
+    fn power_resume_is_not_suspend() {
+        assert!(is_power_resume(0x0006));
+        assert!(is_power_resume(0x0007));
+        assert!(is_power_resume(0x0012));
+        assert!(!is_power_resume(0x0004));
+        assert_eq!(WM_POWERBROADCAST, 0x0218);
+    }
+
+    #[test]
+    fn ime_blocks_bounds_focus_script_follows_composing() {
+        assert!(!ime_blocks_bounds_focus_script(false));
+        assert!(ime_blocks_bounds_focus_script(true));
+    }
+
+    #[test]
     fn gui_params_are_flags_then_quoted_folder() {
         let folder = Path::new(r"C:\Users\Peter\Desktop\StarDust");
         assert_eq!(
@@ -2410,6 +2851,31 @@ mod tests {
         let u = folder_url(Path::new(r"C:\Users\Peter\Desktop"));
         assert!(u.contains("127.0.0.1:6006"));
         assert!(u.contains("open="));
+    }
+
+    #[test]
+    fn native_window_url_open_stays_cover_in_stardust_mode() {
+        let folder = Path::new(r"C:\Users\Peter\Documents");
+        assert_eq!(
+            native_window_url(true, None, UiMode::Windows),
+            desktop_url(),
+            "--desktop always uses ?desktop=1"
+        );
+        assert_eq!(
+            native_window_url(false, Some(folder), UiMode::Stardust),
+            desktop_url(),
+            "--open + StarDust mode loads the work-area cover"
+        );
+        assert_eq!(
+            native_window_url(false, Some(folder), UiMode::Windows),
+            folder_url(folder),
+            "--open while Windows UI stays ?open="
+        );
+        assert_eq!(
+            native_window_url(true, Some(folder), UiMode::Windows),
+            desktop_url(),
+            "--desktop wins when both flags are set"
+        );
     }
 
     #[cfg(windows)]
@@ -2511,6 +2977,71 @@ mod tests {
         assert_eq!(after.color, "yellow");
         assert_eq!(after.reason, "http-down");
         assert_eq!(REBUILD_HOLD_SECS, 660);
+    }
+
+    #[test]
+    fn server_ok_does_not_clear_unexpired_rebuild_hold() {
+        let now = 1_700_000_000;
+        let until = now + REBUILD_HOLD_SECS;
+        let mode = armed_stardust(1, until);
+        assert_eq!(rebuild_hold_until_after_probe(until, true), until);
+        assert_eq!(rebuild_hold_until_after_probe(until, false), until);
+        assert!(in_rebuild_hold_at(&mode, now));
+        assert_eq!(REBUILD_HOLD_SECS, 660);
+    }
+
+    fn sample_health(color: &str, reason: &str, server_ok: bool) -> HealthFile {
+        HealthFile {
+            color: color.into(),
+            reason: reason.into(),
+            server_ok,
+            heartbeat_ok: true,
+            ui_pulse_ok: reason != "ui-pulse-stale",
+            registry_ok: true,
+            backup_ok: true,
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn after_restart_failovers_only_when_http_still_down() {
+        let green = sample_health("green", "", true);
+        let http_down = sample_health("yellow", "http-down", false);
+        let pulse = sample_health("yellow", "ui-pulse-stale", true);
+        let heartbeat = sample_health("yellow", "heartbeat-stale", true);
+        assert!(!after_restart_should_failover(&green));
+        assert!(after_restart_should_failover(&http_down));
+        assert!(!after_restart_should_failover(&pulse));
+        assert!(!after_restart_should_failover(&heartbeat));
+        assert!(after_host_restart_action(true, &http_down));
+        assert!(!after_host_restart_action(true, &green));
+        assert!(!after_host_restart_action(true, &pulse));
+        assert!(
+            !after_host_restart_action(false, &http_down),
+            "rebuild-hold skip must not failover after-restart"
+        );
+        assert!(restart_host_uses_desktop_cover(&armed_stardust(1, 0)));
+        assert!(!restart_host_uses_desktop_cover(&UiModeFile::default()));
+    }
+
+    #[test]
+    fn yellow_heartbeat_stale_skips_restart_like_ui_pulse() {
+        assert!(yellow_reason_skips_host_restart("ui-pulse-stale"));
+        assert!(yellow_reason_skips_host_restart("heartbeat-stale"));
+        assert!(!yellow_reason_skips_host_restart("http-down"));
+        assert!(!yellow_reason_skips_host_restart("missing-backup"));
+        assert!(!yellow_reason_skips_host_restart("open-storm"));
+    }
+
+    #[test]
+    fn yellow_http_down_skips_restart_when_other_app_fg() {
+        assert!(yellow_http_down_skips_for_other_app("http-down", true));
+        assert!(!yellow_http_down_skips_for_other_app("http-down", false));
+        assert!(!yellow_http_down_skips_for_other_app("open-storm", true));
+        assert!(!yellow_http_down_skips_for_other_app("missing-backup", true));
+        assert!(!yellow_http_down_skips_for_other_app("hotkey", true));
+        assert!(!yellow_http_down_skips_for_other_app("ui-pulse-stale", true));
+        assert!(!yellow_http_down_skips_for_other_app("heartbeat-stale", true));
     }
 
     #[test]

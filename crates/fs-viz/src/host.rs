@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,7 @@ const TEXT_PROBE: usize = 8 * 1024;
 const SEARCH_CAP: usize = 200;
 const SEARCH_VISIT_CAP: usize = 100_000;
 const SEARCH_EXTRA_VISIT_CAP: usize = 12_000;
+const EXISTS_CHILD_CAP: usize = 40;
 const CARGO_TIMEOUT: Duration = Duration::from_secs(600);
 
 static WS_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -558,11 +559,30 @@ fn search_score(h: &Hit, q_lc: &str, root: &Path, jump: Option<&Path>) -> i32 {
     s
 }
 
-pub fn search(root: &str, q: &str) -> ApiResult {
+fn emit_hit(hits: &mut Vec<Hit>, h: Hit, emit: &mut dyn FnMut(&Hit)) {
+    emit(&h);
+    hits.push(h);
+}
+
+pub fn search_prepare(root: &str, q: &str) -> Result<(), ApiError> {
     if q.is_empty() {
-        return Ok(json!({ "hits": [] }));
+        return Ok(());
     }
     let root = resolve_abs(root)?;
+    reject_forbidden_move(&root)?;
+    require_exists(&root)?;
+    if !root.is_dir() {
+        return Err(ApiError::bad("root must be a directory"));
+    }
+    Ok(())
+}
+
+fn search_hits(root: &str, q: &str, emit: &mut dyn FnMut(&Hit)) -> Result<Vec<Hit>, ApiError> {
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = resolve_abs(root)?;
+    reject_forbidden_move(&root)?;
     require_exists(&root)?;
     if !root.is_dir() {
         return Err(ApiError::bad("root must be a directory"));
@@ -571,7 +591,9 @@ pub fn search(root: &str, q: &str) -> ApiResult {
     let mut hits = Vec::new();
     let jump = path_jump_candidate(&root, q);
     if let Some(ref p) = jump {
-        hits.push(hit_from_path(p));
+        if !forbidden_path(p) {
+            emit_hit(&mut hits, hit_from_path(p), emit);
+        }
     }
     let mut visited = HashSet::new();
     let mut visits = 0usize;
@@ -584,12 +606,16 @@ pub fn search(root: &str, q: &str) -> ApiResult {
             .parent()
             .map(path_to_string)
             .unwrap_or_default();
-        hits.push(Hit {
-            path: path_to_string(&root),
-            name: root_name,
-            parent,
-            kind: "dir".into(),
-        });
+        emit_hit(
+            &mut hits,
+            Hit {
+                path: path_to_string(&root),
+                name: root_name,
+                parent,
+                kind: "dir".into(),
+            },
+            emit,
+        );
     }
     search_walk(
         &root,
@@ -599,6 +625,7 @@ pub fn search(root: &str, q: &str) -> ApiResult {
         &mut visits,
         SEARCH_VISIT_CAP,
         SEARCH_CAP,
+        emit,
     );
     let root_key = root.canonicalize().unwrap_or_else(|_| root.clone());
     for extra in extra_search_roots() {
@@ -615,12 +642,16 @@ pub fn search(root: &str, q: &str) -> ApiResult {
             .unwrap_or_default();
         if !extra_name.is_empty() && extra_name.to_lowercase().contains(&q_lc) {
             let parent = extra.parent().map(path_to_string).unwrap_or_default();
-            hits.push(Hit {
-                path: path_to_string(&extra),
-                name: extra_name,
-                parent,
-                kind: "dir".into(),
-            });
+            emit_hit(
+                &mut hits,
+                Hit {
+                    path: path_to_string(&extra),
+                    name: extra_name,
+                    parent,
+                    kind: "dir".into(),
+                },
+                emit,
+            );
         }
         let mut extra_visits = 0usize;
         search_walk(
@@ -631,6 +662,7 @@ pub fn search(root: &str, q: &str) -> ApiResult {
             &mut extra_visits,
             SEARCH_EXTRA_VISIT_CAP,
             SEARCH_CAP + 80,
+            emit,
         );
     }
     {
@@ -645,7 +677,22 @@ pub fn search(root: &str, q: &str) -> ApiResult {
     if hits.len() > SEARCH_CAP {
         hits.truncate(SEARCH_CAP);
     }
+    Ok(hits)
+}
+
+pub fn search(root: &str, q: &str) -> ApiResult {
+    let hits = search_hits(root, q, &mut |_| {})?;
     Ok(json!({ "hits": hits }))
+}
+
+pub fn search_ndjson(root: &str, q: &str, w: &mut dyn Write) -> ApiResult {
+    let hits = search_hits(root, q, &mut |h| {
+        let _ = writeln!(w, "{}", json!({ "hit": h }));
+        let _ = w.flush();
+    })?;
+    let _ = writeln!(w, "{}", json!({ "done": true, "hits": hits }));
+    let _ = w.flush();
+    Ok(json!({ "ok": true }))
 }
 
 fn search_walk(
@@ -656,6 +703,7 @@ fn search_walk(
     visits: &mut usize,
     visit_cap: usize,
     hit_cap: usize,
+    emit: &mut dyn FnMut(&Hit),
 ) {
     if hits.len() >= hit_cap || *visits >= visit_cap {
         return;
@@ -682,12 +730,16 @@ fn search_walk(
         let kind = entry_kind(&child);
         let name_lc = name.to_lowercase();
         if name_lc.contains(q_lc) {
-            hits.push(Hit {
-                path: path_to_string(&child),
-                name: name.clone(),
-                parent: path_to_string(dir),
-                kind: kind.into(),
-            });
+            emit_hit(
+                &mut *hits,
+                Hit {
+                    path: path_to_string(&child),
+                    name: name.clone(),
+                    parent: path_to_string(dir),
+                    kind: kind.into(),
+                },
+                emit,
+            );
         }
         if kind == "dir" && !search_skip_descend(&name) {
             if name_lc.contains(q_lc) {
@@ -701,13 +753,26 @@ fn search_walk(
         if hits.len() >= hit_cap || *visits >= visit_cap {
             return;
         }
-        search_walk(child.as_path(), q_lc, hits, visited, visits, visit_cap, hit_cap);
+        search_walk(
+            child.as_path(),
+            q_lc,
+            hits,
+            visited,
+            visits,
+            visit_cap,
+            hit_cap,
+            emit,
+        );
     }
 }
 
 pub fn open_external(path: &str) -> ApiResult {
     let path = resolve_abs(path)?;
+    reject_forbidden_move(&path)?;
     require_exists(&path)?;
+    if path.is_dir() {
+        return Err(ApiError::bad("path is a directory; use jump"));
+    }
     let path_s = path_to_string(&path);
     #[cfg(windows)]
     {
@@ -744,6 +809,40 @@ pub fn stat(path: &str) -> ApiResult {
     }))
 }
 
+fn child_names(dir: &Path, cap: usize) -> Vec<String> {
+    let mut names: Vec<String> = match fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    if names.len() > cap {
+        names.truncate(cap);
+    }
+    names
+}
+
+/// Existence without navigating the cosmos. Missing → `{ exists: false }` (not 404).
+pub fn exists(path: &str) -> ApiResult {
+    let path = resolve_abs(path)?;
+    reject_forbidden_move(&path)?;
+    if !path.exists() {
+        return Ok(json!({ "exists": false }));
+    }
+    let kind = if path.is_dir() { "dir" } else { "file" };
+    if kind == "dir" {
+        Ok(json!({
+            "exists": true,
+            "kind": "dir",
+            "children": child_names(&path, EXISTS_CHILD_CAP),
+        }))
+    } else {
+        Ok(json!({ "exists": true, "kind": "file" }))
+    }
+}
+
 pub fn get_layout() -> Value {
     let p = layout_file();
     let Ok(text) = fs::read_to_string(&p) else {
@@ -766,6 +865,16 @@ pub fn put_layout(value: &Value) -> ApiResult {
     let pretty = serde_json::to_string_pretty(value).map_err(|e| ApiError::bad(e.to_string()))?;
     fs::write(&p, pretty).map_err(io_err)?;
     Ok(json!({ "ok": true }))
+}
+
+/// `POST /api/ime` body: `{ "composing": true|false }`. Missing or non-bool → 400.
+pub fn parse_ime_composing(v: &Value) -> Result<bool, ApiError> {
+    match v.get("composing") {
+        None => Err(ApiError::bad("composing required")),
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| ApiError::bad("composing must be a bool")),
+    }
 }
 
 pub fn get_agent_history() -> Value {
@@ -794,8 +903,14 @@ pub fn put_agent_history(value: &Value) -> ApiResult {
 
 pub fn mkdir(path: &str) -> ApiResult {
     let path = resolve_abs(path)?;
+    reject_forbidden_move(&path)?;
     if path.exists() {
         return Err(ApiError::conflict("path already exists"));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(ApiError::bad("parent directory does not exist"));
+        }
     }
     fs::create_dir(&path).map_err(io_err)?;
     Ok(json!({ "ok": true }))
@@ -870,6 +985,24 @@ fn is_stardust_ws_path(p: &Path) -> bool {
             .to_ascii_lowercase()
             .starts_with("stardust-ws-")
     })
+}
+
+fn is_appdata_component(p: &Path) -> bool {
+    p.components().any(|c| {
+        let n = c.as_os_str().to_string_lossy();
+        n.eq_ignore_ascii_case("AppData") || n.eq_ignore_ascii_case("Application Data")
+    })
+}
+
+fn forbidden_path(p: &Path) -> bool {
+    is_stardust_ws_path(p) || is_appdata_component(p)
+}
+
+fn reject_forbidden_move(p: &Path) -> Result<(), ApiError> {
+    if forbidden_path(p) {
+        return Err(ApiError::bad("refuses AppData / agent temp workspace"));
+    }
+    Ok(())
 }
 
 fn reject_temp_workspace_dest(p: &Path) -> Result<(), ApiError> {
@@ -1051,6 +1184,8 @@ pub fn duplicate(v: &Value) -> ApiResult {
 pub fn move_path(from: &str, to: &str) -> ApiResult {
     let from = resolve_abs(from)?;
     let to = resolve_abs(to)?;
+    reject_forbidden_move(&from)?;
+    reject_forbidden_move(&to)?;
     require_exists(&from)?;
     if to.exists() {
         return Err(ApiError::conflict("destination already exists"));
@@ -1063,6 +1198,96 @@ pub fn move_path(from: &str, to: &str) -> ApiResult {
             Ok(json!({ "ok": true }))
         }
     }
+}
+
+pub fn agent_out_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".stardust-out")
+}
+
+fn cap_screen_dir() -> PathBuf {
+    agent_out_dir().join("cap-screen")
+}
+
+pub(crate) fn sanitize_out_name(name: &str) -> Result<String, ApiError> {
+    let t = name.trim();
+    if t.is_empty() {
+        return Err(ApiError::bad("name is required"));
+    }
+    if t.contains('/') || t.contains('\\') || t.contains(':') {
+        return Err(ApiError::bad("name must be a file name, not a path"));
+    }
+    if t == "." || t == ".." || t.eq_ignore_ascii_case("cap-screen") {
+        return Err(ApiError::bad("invalid name"));
+    }
+    if t.chars().any(|c| c.is_control() || c == '\0') {
+        return Err(ApiError::bad("invalid name"));
+    }
+    Ok(t.to_string())
+}
+
+pub fn agent_out_write(v: &Value) -> ApiResult {
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+    let name = sanitize_out_name(name)?;
+    let content = if let Some(s) = v.get("content").and_then(|x| x.as_str()) {
+        s.to_string()
+    } else if let Some(other) = v.get("content") {
+        other.to_string()
+    } else {
+        String::new()
+    };
+    let dir = agent_out_dir();
+    fs::create_dir_all(&dir).map_err(io_err)?;
+    let dest = dir.join(&name);
+    if dest.parent() != Some(dir.as_path()) {
+        return Err(ApiError::bad("invalid name"));
+    }
+    fs::write(&dest, content.as_bytes()).map_err(io_err)?;
+    Ok(json!({
+        "ok": true,
+        "path": path_to_string(&dest),
+        "name": name,
+    }))
+}
+
+fn sweep_prefix_dir(dir: &Path, prefixes: &[&str]) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_ascii_lowercase();
+        if prefixes.iter().any(|p| name.starts_with(p)) {
+            let p = ent.path();
+            let _ = if p.is_dir() {
+                fs::remove_dir_all(&p)
+            } else {
+                fs::remove_file(&p)
+            };
+        }
+    }
+}
+
+pub fn sweep_agent_caps() -> ApiResult {
+    let cap = cap_screen_dir();
+    let _ = fs::create_dir_all(&cap);
+    if cap.is_dir() {
+        if let Ok(rd) = fs::read_dir(&cap) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let _ = if p.is_dir() {
+                    fs::remove_dir_all(&p)
+                } else {
+                    fs::remove_file(&p)
+                };
+            }
+        }
+    }
+    for desk in extra_search_roots() {
+        sweep_prefix_dir(&desk, &["cap-screen", "wa-view"]);
+    }
+    Ok(json!({ "ok": true }))
 }
 
 #[derive(Serialize)]
@@ -1344,9 +1569,10 @@ pub fn cargo_test(cwd: &str) -> ApiResult {
         return Err(ApiError::bad("cwd must be a directory"));
     }
     let mut child = Command::new("cargo");
-    child.arg("test").current_dir(&cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    child.arg("test").current_dir(&cwd);
     apply_gnu_linker(&mut child);
     fs_viz::shell::windows_no_window(&mut child);
+    child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = child
         .spawn()
         .map_err(|e| ApiError::internal(format!("spawn cargo: {e}")))?;
@@ -1452,15 +1678,43 @@ fn debug_fs_viz(workspace: &Path) -> PathBuf {
     }
 }
 
-fn stash_path(path: &Path) {
+/// Sidecar for a running/locked binary. Never reuse a leftover `*.old` that
+/// another process still holds (os error 5 on remove/rename).
+fn stash_dest(path: &Path, n: u32) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    if n == 0 {
+        s.push(".old");
+    } else {
+        s.push(format!(".old{n}"));
+    }
+    PathBuf::from(s)
+}
+
+fn cargo_lock_error(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("os error 5") || t.contains("access is denied")
+}
+
+fn stash_one(path: &Path) {
     if !path.is_file() {
         return;
     }
-    let mut old = path.as_os_str().to_os_string();
-    old.push(".old");
-    let old = PathBuf::from(old);
-    let _ = fs::remove_file(&old);
-    let _ = fs::rename(path, &old);
+    for n in 0..64u32 {
+        let dest = stash_dest(path, n);
+        if dest.exists() && fs::remove_file(&dest).is_err() {
+            continue;
+        }
+        if fs::rename(path, &dest).is_ok() {
+            return;
+        }
+    }
+}
+
+fn stash_path(path: &Path) {
+    stash_one(path);
+    if path.extension().and_then(|e| e.to_str()) == Some("exe") {
+        stash_one(&path.with_extension("pdb"));
+    }
 }
 
 fn stash_running_binaries(dir: &Path) {
@@ -1491,11 +1745,11 @@ fn stash_running_binaries(dir: &Path) {
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if !name.ends_with(".exe") {
+            if !(name.ends_with(".exe") || name.ends_with(".pdb")) {
                 continue;
             }
             if prefixes.iter().any(|p| name.starts_with(p)) {
-                stash_path(&path);
+                stash_one(&path);
             }
         }
     }
@@ -1550,25 +1804,83 @@ fn schedule_ui_relaunch(exe: &Path, cwd: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn rebuild_ui() -> ApiResult {
-    let cwd = workspace_root();
-    if !cwd.is_dir() {
-        return Err(ApiError::internal("workspace root missing"));
+const REBUILD_FEATURE_NAMES: &[&str] = &["python", "llvm", "haskell", "lean"];
+
+fn current_rebuild_features() -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg!(feature = "python") {
+        out.push("python".to_string());
     }
-    fs_viz::shell::bump_arm_grace();
-    fs_viz::shell::begin_rebuild_hold();
-    let bin_dir = debug_bin_dir(&cwd);
-    stash_running_binaries(&bin_dir);
+    if cfg!(feature = "llvm") {
+        out.push("llvm".to_string());
+    }
+    if cfg!(feature = "haskell") {
+        out.push("haskell".to_string());
+    }
+    if cfg!(feature = "lean") {
+        out.push("lean".to_string());
+    }
+    out
+}
+
+fn union_rebuild_features(current: &[String], requested: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in REBUILD_FEATURE_NAMES {
+        if current.iter().any(|f| f == name) || requested.iter().any(|f| f == name) {
+            out.push((*name).to_string());
+        }
+    }
+    out
+}
+
+fn normalize_rebuild_feature(name: &str) -> Result<String, ApiError> {
+    let lower = name.to_ascii_lowercase();
+    if REBUILD_FEATURE_NAMES.contains(&lower.as_str()) {
+        Ok(lower)
+    } else {
+        Err(ApiError::bad(format!("unknown feature: {name}")))
+    }
+}
+
+pub fn parse_rebuild_features(v: &Value) -> Result<Vec<String>, ApiError> {
+    let current = current_rebuild_features();
+    match v.get("features") {
+        None | Some(Value::Null) => Ok(current),
+        Some(Value::Array(arr)) => {
+            if arr.is_empty() {
+                return Ok(current);
+            }
+            let mut requested = Vec::with_capacity(arr.len());
+            for item in arr {
+                let raw = item
+                    .as_str()
+                    .ok_or_else(|| ApiError::bad("features must be an array of strings"))?;
+                requested.push(normalize_rebuild_feature(raw)?);
+            }
+            Ok(union_rebuild_features(&current, &requested))
+        }
+        Some(_) => Err(ApiError::bad("features must be an array")),
+    }
+}
+
+fn cargo_build_cmdline(features: &[String]) -> String {
+    if features.is_empty() {
+        "cargo build -p fs-viz".to_string()
+    } else {
+        format!("cargo build -p fs-viz --features {}", features.join(","))
+    }
+}
+
+fn run_fs_viz_cargo(cwd: &Path, features: &[String]) -> Result<std::process::Output, ApiError> {
     let mut cmd = Command::new("cargo");
-    #[cfg(feature = "python")]
-    cmd.args(["build", "-p", "fs-viz", "--features", "python"]);
-    #[cfg(not(feature = "python"))]
     cmd.args(["build", "-p", "fs-viz"]);
-    cmd.current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    if !features.is_empty() {
+        cmd.args(["--features", &features.join(",")]);
+    }
+    cmd.current_dir(cwd);
     apply_gnu_linker(&mut cmd);
     fs_viz::shell::windows_no_window(&mut cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = cmd
         .spawn()
         .map_err(|e| ApiError::internal(format!("spawn cargo: {e}")))?;
@@ -1578,46 +1890,7 @@ pub fn rebuild_ui() -> ApiResult {
         let _ = tx.send(child.wait_with_output());
     });
     match rx.recv_timeout(CARGO_TIMEOUT) {
-        Ok(Ok(output)) => {
-            let mut text = String::new();
-            #[cfg(feature = "python")]
-            text.push_str("cargo build -p fs-viz --features python\n");
-            #[cfg(not(feature = "python"))]
-            text.push_str("cargo build -p fs-viz\n");
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            let ok = output.status.success();
-            if ok {
-                fs_viz::shell::bump_arm_grace();
-                fs_viz::shell::begin_rebuild_hold();
-                #[cfg(windows)]
-                fs_viz::shell::close_native_windows();
-                let exe = debug_fs_viz(&cwd);
-                if let Err(e) = schedule_ui_relaunch(&exe, &cwd) {
-                    text.push_str("\n");
-                    text.push_str(&e);
-                    return Ok(json!({ "status": -1, "output": text, "relaunch": false }));
-                }
-                text.push_str("\n");
-                text.push_str(&format!(
-                    "{} --desktop --replace\nRelaunching…",
-                    if cfg!(windows) {
-                        "target\\debug\\fs-viz.exe"
-                    } else {
-                        "target/debug/fs-viz"
-                    }
-                ));
-                std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_millis(800));
-                    std::process::exit(0);
-                });
-            }
-            Ok(json!({
-                "status": output.status.code().unwrap_or(-1),
-                "output": text,
-                "relaunch": ok,
-            }))
-        }
+        Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(ApiError::internal(format!("cargo: {e}"))),
         Err(_) => {
             kill_pid(pid);
@@ -1629,112 +1902,96 @@ pub fn rebuild_ui() -> ApiResult {
     }
 }
 
-fn is_cursor_gui(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|n| n.eq_ignore_ascii_case("Cursor.exe"))
-            .unwrap_or(false)
-}
-
-fn cursor_exe_beside(path: &Path) -> Option<PathBuf> {
-    let mut dir = path.parent()?;
-    for _ in 0..4 {
-        let cand = dir.join("Cursor.exe");
-        if is_cursor_gui(&cand) {
-            return Some(cand);
-        }
-        dir = dir.parent()?;
+pub fn rebuild_ui(features: &[String]) -> ApiResult {
+    let cwd = workspace_root();
+    if !cwd.is_dir() {
+        return Err(ApiError::internal("workspace root missing"));
     }
-    None
-}
-
-fn find_cursor_exe() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let typical = PathBuf::from(local)
-                .join("Programs")
-                .join("cursor")
-                .join("Cursor.exe");
-            if is_cursor_gui(&typical) {
-                return Some(typical);
-            }
+    fs_viz::shell::bump_arm_grace();
+    fs_viz::shell::begin_rebuild_hold();
+    let bin_dir = debug_bin_dir(&cwd);
+    stash_running_binaries(&bin_dir);
+    let mut output = run_fs_viz_cargo(&cwd, features)?;
+    let mut text = cargo_build_cmdline(features);
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() && cargo_lock_error(&text) {
+        #[cfg(windows)]
+        {
+            fs_viz::shell::close_native_windows();
+            std::thread::sleep(Duration::from_millis(900));
         }
-        for key in ["ProgramFiles", "ProgramFiles(x86)"] {
-            if let Ok(root) = std::env::var(key) {
-                let cand = PathBuf::from(root).join("cursor").join("Cursor.exe");
-                if is_cursor_gui(&cand) {
-                    return Some(cand);
-                }
-            }
-        }
-        for root in [r"C:\Program Files", r"C:\Program Files (x86)"] {
-            let cand = PathBuf::from(root).join("cursor").join("Cursor.exe");
-            if is_cursor_gui(&cand) {
-                return Some(cand);
-            }
-        }
-        for arg in ["Cursor.exe", "cursor"] {
-            let mut cmd = Command::new("where");
-            cmd.arg(arg);
-            fs_viz::shell::windows_no_window(&mut cmd);
-            let Ok(out) = cmd.output() else {
-                continue;
-            };
-            if !out.status.success() {
-                continue;
-            }
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let p = PathBuf::from(line.trim());
-                if p.as_os_str().is_empty() {
-                    continue;
-                }
-                if is_cursor_gui(&p) {
-                    return Some(p);
-                }
-                if let Some(gui) = cursor_exe_beside(&p) {
-                    return Some(gui);
-                }
-            }
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let p = dir.join("Cursor.exe");
-                if is_cursor_gui(&p) {
-                    return Some(p);
-                }
-            }
-        }
-        None
+        stash_running_binaries(&bin_dir);
+        text.push_str("\nretry after stash (os error 5 / access denied)\n");
+        output = run_fs_viz_cargo(&cwd, features)?;
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
-    #[cfg(not(windows))]
-    {
-        let out = Command::new("which").arg("cursor").output().ok()?;
-        if !out.status.success() {
-            return None;
+    let ok = output.status.success();
+    if ok {
+        fs_viz::shell::bump_arm_grace();
+        fs_viz::shell::begin_rebuild_hold();
+        #[cfg(windows)]
+        fs_viz::shell::close_native_windows();
+        let exe = debug_fs_viz(&cwd);
+        if let Err(e) = schedule_ui_relaunch(&exe, &cwd) {
+            text.push_str("\n");
+            text.push_str(&e);
+            return Ok(json!({ "status": -1, "output": text, "relaunch": false }));
         }
-        let line = String::from_utf8_lossy(&out.stdout);
-        let p = PathBuf::from(line.lines().next().unwrap_or("").trim());
-        p.is_file().then_some(p)
+        text.push_str("\n");
+        text.push_str(&format!(
+            "{} --desktop --replace\nRelaunching…",
+            if cfg!(windows) {
+                "target\\debug\\fs-viz.exe"
+            } else {
+                "target/debug/fs-viz"
+            }
+        ));
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(800));
+            std::process::exit(0);
+        });
     }
+    Ok(json!({
+        "status": output.status.code().unwrap_or(-1),
+        "output": text,
+        "relaunch": ok,
+    }))
 }
 
 /// Open the StarDust repo folder in the Cursor GUI (`Cursor.exe`, not `cursor.cmd`).
-/// Passes `--classic --new-window` before the folder so launch matches the classic
-/// editor and an already-running Cursor cannot swallow the click.
+/// HTTP only `PostMessage`s `StarDustOpenCursor` to `StarDustHost`; the view thread
+/// `ShellExecuteW`s `--classic --new-window` then the folder.
 pub fn open_cursor() -> ApiResult {
     let cwd = workspace_root();
     if !cwd.is_dir() {
         return Err(ApiError::internal("workspace root missing"));
     }
-    let Some(exe) = find_cursor_exe() else {
+    if fs_viz::shell::find_cursor_exe().is_none() {
         return Err(ApiError::bad("Cursor.exe not found"));
-    };
-    fs_viz::shell::shell_open_gui(&exe, &cwd, &["--classic", "--new-window"])
-        .map_err(|e| ApiError::internal(format!("open Cursor: {e}")))?;
-    Ok(json!({ "ok": true }))
+    }
+    #[cfg(windows)]
+    {
+        fs_viz::shell::post_open_cursor().map_err(|e| {
+            if e == "no StarDustHost" {
+                ApiError {
+                    status: 503,
+                    body: json!({ "error": e }),
+                }
+            } else {
+                ApiError::internal(e)
+            }
+        })?;
+        return Ok(json!({ "ok": true }));
+    }
+    #[cfg(not(windows))]
+    {
+        fs_viz::shell::open_cursor_gui()
+            .map_err(|e| ApiError::internal(format!("open Cursor: {e}")))?;
+        Ok(json!({ "ok": true }))
+    }
 }
 
 fn unique_link_name(used: &mut HashSet<String>, base: &str) -> String {
@@ -2039,7 +2296,7 @@ fn from_hex(b: u8) -> Option<u8> {
 fn ui_op_ok(op: &str) -> bool {
     matches!(
         op,
-        "look-at-view" | "navigate" | "open" | "select" | "pin" | "copy"
+        "look-at-view" | "navigate" | "open" | "select" | "pin" | "copy" | "search" | "jump"
     )
 }
 
@@ -2061,7 +2318,7 @@ fn ui_enqueue_timeout(op: &str, args: Value, timeout: Duration) -> ApiResult {
     let op = op.trim();
     if !ui_op_ok(op) {
         return Err(ApiError::bad(
-            "op must be look-at-view, navigate, open, select, pin, or copy",
+            "op must be look-at-view, navigate, open, select, pin, copy, search, or jump",
         ));
     }
     let id = format!("ui-{}", UI_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -2102,20 +2359,19 @@ fn ui_enqueue_timeout(op: &str, args: Value, timeout: Duration) -> ApiResult {
     }
 }
 
-/// Web UI short-poll: drain queued commands.
+/// Web UI short-poll: take one queued command; leave the rest.
 pub fn ui_inbox_take() -> Value {
     with_inbox(|inbox| {
-        let commands: Vec<Value> = inbox
-            .pending
-            .drain(..)
-            .map(|c| {
-                json!({
-                    "id": c.id,
-                    "op": c.op,
-                    "args": c.args,
-                })
-            })
-            .collect();
+        let commands: Vec<Value> = if inbox.pending.is_empty() {
+            Vec::new()
+        } else {
+            let c = inbox.pending.remove(0);
+            vec![json!({
+                "id": c.id,
+                "op": c.op,
+                "args": c.args,
+            })]
+        };
         json!({ "commands": commands })
     })
 }
@@ -2253,7 +2509,17 @@ mod search_tests {
     static UI_TEST: Mutex<()> = Mutex::new(());
 
     fn drain_ui() {
-        let _ = ui_inbox_take();
+        for _ in 0..UI_INBOX_CAP + 2 {
+            let v = ui_inbox_take();
+            let n = v["commands"].as_array().map(|a| a.len()).unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+        }
+    }
+
+    fn ui_inbox_pending_len() -> usize {
+        with_inbox(|inbox| inbox.pending.len())
     }
 
     #[test]
@@ -2269,6 +2535,17 @@ mod search_tests {
         let v = ui_enqueue_timeout("copy", json!({ "paths": [] }), Duration::from_millis(40)).unwrap();
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap_or("").contains("timed out"));
+    }
+
+    #[test]
+    fn ui_search_and_jump_ops_are_allowed() {
+        let _g = UI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        drain_ui();
+        let s = ui_enqueue_timeout("search", json!({ "q": "x" }), Duration::from_millis(40)).unwrap();
+        assert!(s["error"].as_str().unwrap_or("").contains("timed out"));
+        drain_ui();
+        let j = ui_enqueue_timeout("jump", json!({ "path": "C:\\" }), Duration::from_millis(40)).unwrap();
+        assert!(j["error"].as_str().unwrap_or("").contains("timed out"));
     }
 
     #[test]
@@ -2301,6 +2578,40 @@ mod search_tests {
         let out = h.join().expect("join").expect("enqueue");
         assert_eq!(out["ok"], true);
         assert_eq!(out["op"], "select");
+    }
+
+    #[test]
+    fn ui_inbox_take_one_leaves_queued() {
+        let _g = UI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        drain_ui();
+        let h1 = std::thread::spawn(|| {
+            ui_enqueue_timeout("select", json!({ "names": ["a"] }), Duration::from_secs(5))
+        });
+        let h2 = std::thread::spawn(|| {
+            ui_enqueue_timeout("pin", json!({ "names": ["b"] }), Duration::from_secs(5))
+        });
+        let mut ready = false;
+        for _ in 0..80 {
+            if ui_inbox_pending_len() >= 2 {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready, "both commands should queue before take");
+        let first = ui_inbox_take();
+        let cmds = first["commands"].as_array().cloned().unwrap_or_default();
+        assert_eq!(cmds.len(), 1, "take must return one command");
+        assert_eq!(ui_inbox_pending_len(), 1, "second command must remain queued");
+        let id1 = cmds[0]["id"].as_str().expect("id");
+        ui_post_result(&json!({ "ok": true, "id": id1, "op": cmds[0]["op"] })).unwrap();
+        let second = ui_inbox_take();
+        let cmds2 = second["commands"].as_array().cloned().unwrap_or_default();
+        assert_eq!(cmds2.len(), 1);
+        let id2 = cmds2[0]["id"].as_str().expect("id");
+        ui_post_result(&json!({ "ok": true, "id": id2, "op": cmds2[0]["op"] })).unwrap();
+        let _ = h1.join().expect("join1");
+        let _ = h2.join().expect("join2");
     }
 
     #[test]
@@ -2420,6 +2731,17 @@ mod duplicate_tests {
     use super::*;
 
     #[test]
+    fn sanitize_out_name_rejects_paths() {
+        assert!(sanitize_out_name("").is_err());
+        assert!(sanitize_out_name("..").is_err());
+        assert!(sanitize_out_name("../x.txt").is_err());
+        assert!(sanitize_out_name("a/b.txt").is_err());
+        assert!(sanitize_out_name("a\\b.txt").is_err());
+        assert!(sanitize_out_name("cap-screen").is_err());
+        assert_eq!(sanitize_out_name("notes.txt").unwrap(), "notes.txt");
+    }
+
+    #[test]
     fn explorer_copy_names_keep_extension() {
         assert_eq!(
             explorer_copy_candidate("Anchor - Cytus II.txt", 1),
@@ -2438,6 +2760,51 @@ mod duplicate_tests {
         let p = PathBuf::from(std::env::temp_dir()).join("stardust-ws-1-2").join("file.txt");
         assert!(is_stardust_ws_path(&p));
         assert!(!is_stardust_ws_path(&std::env::temp_dir()));
+    }
+
+    #[test]
+    fn forbidden_path_detects_appdata_and_ws() {
+        let appdata = PathBuf::from("C:")
+            .join("Users")
+            .join("x")
+            .join("AppData")
+            .join("Roaming")
+            .join("StarDust");
+        let legacy = PathBuf::from("C:")
+            .join("Users")
+            .join("x")
+            .join("Application Data")
+            .join("foo");
+        let ws = PathBuf::from("tmp").join("stardust-ws-1").join("a");
+        let desk = PathBuf::from("C:").join("Users").join("x").join("Desktop").join("file.txt");
+        assert!(forbidden_path(&appdata));
+        assert!(forbidden_path(&legacy));
+        assert!(forbidden_path(&ws));
+        assert!(!forbidden_path(&desk));
+    }
+
+    #[test]
+    fn exists_missing_path_is_false() {
+        let p = PathBuf::from(r"C:\no-such-stardust-exists-probe").join(format!(
+            "missing-{}.txt",
+            std::process::id()
+        ));
+        let v = exists(&path_to_string(&p)).expect("exists");
+        assert_eq!(v["exists"], false);
+        assert!(v.get("kind").is_none());
+        assert!(v.get("children").is_none());
+    }
+
+    #[test]
+    fn mkdir_rejects_appdata() {
+        let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming\StarDust\agent-mkdir-nope");
+        let err = mkdir(&path_to_string(&appdata)).expect_err("AppData mkdir");
+        assert_eq!(err.status, 400);
+        let msg = err.body["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("AppData") || msg.contains("temp workspace"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -2530,5 +2897,81 @@ mod gnu_linker_tests {
         assert_eq!(found, real);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+
+    #[test]
+    fn parse_ime_composing_true_false_and_missing_is_400() {
+        assert_eq!(parse_ime_composing(&json!({ "composing": true })).unwrap(), true);
+        assert_eq!(parse_ime_composing(&json!({ "composing": false })).unwrap(), false);
+        let missing = parse_ime_composing(&json!({})).unwrap_err();
+        assert_eq!(missing.status, 400);
+        let bad = parse_ime_composing(&json!({ "composing": "yes" })).unwrap_err();
+        assert_eq!(bad.status, 400);
+    }
+}
+
+#[cfg(test)]
+mod parse_rebuild_tests {
+    use super::*;
+
+    fn current_set() -> Vec<String> {
+        current_rebuild_features()
+    }
+
+    #[test]
+    fn parse_rebuild_empty_json_is_current_set() {
+        assert_eq!(parse_rebuild_features(&json!({})).unwrap(), current_set());
+        assert_eq!(
+            parse_rebuild_features(&json!({ "features": Value::Null })).unwrap(),
+            current_set()
+        );
+        assert_eq!(
+            parse_rebuild_features(&json!({ "features": [] })).unwrap(),
+            current_set()
+        );
+    }
+
+    #[test]
+    fn parse_rebuild_python_includes_python() {
+        let got = parse_rebuild_features(&json!({ "features": ["python"] })).unwrap();
+        assert!(got.iter().any(|f| f == "python"));
+    }
+
+    #[test]
+    fn parse_rebuild_unknown_evil_is_400() {
+        let err = parse_rebuild_features(&json!({ "features": ["evil"] })).unwrap_err();
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn parse_rebuild_mixed_case_python_accepted() {
+        let got = parse_rebuild_features(&json!({ "features": ["Python"] })).unwrap();
+        assert!(got.iter().any(|f| f == "python"));
+    }
+
+    #[test]
+    fn parse_rebuild_non_array_features_is_400() {
+        let err = parse_rebuild_features(&json!({ "features": "python" })).unwrap_err();
+        assert_eq!(err.status, 400);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod cargo_spawn_stdio_tests {
+    use super::*;
+
+    #[test]
+    fn no_window_then_pipe_spawns_cmd() {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit", "0"]);
+        fs_viz::shell::windows_no_window(&mut cmd);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd.output().expect("spawn cmd");
+        assert!(out.status.success(), "{out:?}");
     }
 }
