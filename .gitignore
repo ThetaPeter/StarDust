@@ -7,6 +7,10 @@ __pycache__/
 *.pyc
 *.png
 *.md
+!README.md
+!**/README.md
+!stardust-ui/web/luna-icon.png
+!stardust-ui/images/luna-silhouette.png
 stardust-ui/boot-debug.txt
 stardust-ui/host-err.txt
 stardust-ui/host-out.txt
