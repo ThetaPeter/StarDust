@@ -1,11 +1,7 @@
 # StarDust
 
-One git repo, two Cargo workspaces:
-
 - **[stardust/](stardust/)** — StarDust Library (dumpable IR, named regions, imports, kernel UAPI).
 - **[stardust-ui/](stardust-ui/)** — StarDust UI (cosmos, WebView2, Explorer cover). The crate is `stardust-ui`; the main exe stays `fs-viz`.
-
-There is no Cargo **workspace** at this git root. A small `fs-viz` trampoline package is here so Tools → Rebuild on an older host (`cargo build -p fs-viz` from this folder) still builds [stardust-ui/](stardust-ui/). Library and UI work still run from those folders.
 
 ## Library
 
