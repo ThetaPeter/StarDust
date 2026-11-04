@@ -1,6 +1,0 @@
-[package]
-name = "stardust-lean"
-version = "0.1.0"
-edition = "2021"
-publish = false
-description = "In-tree Lean 4 shared library fixture for StarDust import tests"

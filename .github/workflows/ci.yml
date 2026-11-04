@@ -5,8 +5,11 @@ on:
   pull_request:
 
 jobs:
-  test:
+  library:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stardust
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -21,12 +24,6 @@ jobs:
         run: cargo test --features llvm
       - name: Test with Haskell
         run: cargo test --features haskell
-      - name: Install Lean 4
-        run: |
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
-          echo "$HOME/.elan/bin" >> $GITHUB_PATH
-      - name: Test with Lean
-        run: cargo test --features lean
       - name: Build kernel module
         run: make -C kmod/stardust
       - name: Load kernel module
@@ -38,3 +35,15 @@ jobs:
       - name: Unload kernel module
         if: always()
         run: sudo rmmod stardust || true
+
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stardust-ui
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test

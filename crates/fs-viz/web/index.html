@@ -37,22 +37,16 @@
       <div class="menu">
         <button type="button" class="menu-btn" data-menu="view">View</button>
         <div class="menu-pop" id="menu-view" hidden>
-          <button type="button" id="btn-mode" data-cmd="toggle-mode" title="2D / 3D for the focused view (Ctrl+Shift+2 / Ctrl+Shift+3)">2D<span class="accel">Ctrl+Shift+2 / 3</span></button>
           <button type="button" data-cmd="new-split">New split<span class="accel">Ctrl+N</span></button>
           <button type="button" data-cmd="refresh">Refresh<span class="accel">F5</span></button>
           <hr/>
           <button type="button" data-cmd="tile" title="Arrange file windows in a grid">Tile windows</button>
           <button type="button" data-cmd="cascade" title="Stack file windows with an offset">Cascade windows</button>
           <hr/>
-          <div class="submenu">
-            <button type="button" class="submenu-btn">Sort</button>
-            <div class="menu-pop nested">
-              <button type="button" data-cmd="sort-name">Name</button>
-              <button type="button" data-cmd="sort-type">Type</button>
-              <button type="button" data-cmd="sort-size">Size</button>
-            </div>
+          <div class="menu-layout-field" role="group" aria-label="Grid or Galaxy">
+            <button type="button" data-cmd="grid">Grid</button>
+            <button type="button" data-cmd="galaxy">Galaxy</button>
           </div>
-          <button type="button" data-cmd="galaxy">Galaxy</button>
         </div>
       </div>
       <div class="menu">
@@ -69,7 +63,6 @@
               <button type="button" data-cmd="rebuild-ui-python">Rebuild with Python</button>
               <button type="button" data-cmd="rebuild-ui-llvm">Rebuild with LLVM</button>
               <button type="button" data-cmd="rebuild-ui-haskell">Rebuild with Haskell</button>
-              <button type="button" data-cmd="rebuild-ui-lean">Rebuild with Lean</button>
             </div>
           </div>
         </div>
@@ -88,6 +81,7 @@
   <div id="workspace">
     <div id="main">
       <div id="splits"></div>
+      <div id="user-dock-preview" hidden aria-hidden="true"></div>
       <div id="floats"></div>
     </div>
     <div id="agent-sash" title="Resize agent"></div>
@@ -183,8 +177,6 @@
           <dt>Ctrl+F5</dt><dd>Refresh web (JS/CSS from disk, no Cargo)</dd>
           <dt>Ctrl+N</dt><dd>New split</dd>
           <dt>Ctrl+W</dt><dd>Close cosmos pane</dd>
-          <dt>Ctrl+Shift+2</dt><dd>2D</dd>
-          <dt>Ctrl+Shift+3</dt><dd>3D</dd>
           <dt>Esc</dt><dd>Close menus, search, overlay</dd>
         </dl>
       </section>

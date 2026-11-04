@@ -1,0 +1,81 @@
+[package]
+name = "stardust"
+version = "0.1.0"
+edition = "2021"
+description = "StarDust: dumpable layout IR, heap regions, and region-compatible C imports"
+
+[features]
+python = ["dep:pyo3"]
+llvm = ["dep:stardust-ll"]
+haskell = ["dep:stardust-hs"]
+kernel = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libloading = "0.8"
+libffi = "4"
+memmap2 = "0.9"
+pyo3 = { version = "0.29.2", optional = true, features = ["auto-initialize"] }
+stardust-ll = { path = "crates/stardust-ll", optional = true }
+stardust-hs = { path = "crates/stardust-hs", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+stardust-c = { path = "crates/stardust-c" }
+stardust-rs = { path = "crates/stardust-rs" }
+stardust-packet = { path = "examples/packet" }
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]
+
+[[test]]
+name = "cns"
+path = "tests/cns.rs"
+required-features = ["python"]
+
+[[test]]
+name = "packet"
+path = "tests/packet.rs"
+required-features = ["python"]
+
+[[test]]
+name = "llvm"
+path = "tests/llvm.rs"
+required-features = ["llvm"]
+
+[[test]]
+name = "linux_module"
+path = "tests/linux_module.rs"
+required-features = ["kernel"]
+
+[[test]]
+name = "kmdf"
+path = "tests/kmdf.rs"
+required-features = ["kernel"]
+
+[[test]]
+name = "attach"
+path = "tests/attach.rs"
+required-features = ["kernel"]
+
+[[test]]
+name = "haskell"
+path = "tests/haskell.rs"
+required-features = ["haskell"]
+
+[workspace]
+members = ["crates/stardust-c", "crates/stardust-rs", "crates/stardust-ll", "crates/stardust-hs", "examples/packet"]
+default-members = [".", "crates/stardust-c", "crates/stardust-rs", "examples/packet"]
+
+# Windows GNU: crates.io libffi-sys 3.3.3 uses autotools, which fails here
+# (Git sh path with spaces; LLVM-MinGW clang vs libtool). Same C sources, cc.
+[patch.crates-io]
+libffi-sys = { path = "vendor/libffi-sys" }

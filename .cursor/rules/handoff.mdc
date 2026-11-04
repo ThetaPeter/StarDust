@@ -9,43 +9,44 @@ alwaysApply: true
 
 Agents follow this table. [README.md](README.md) repeats a short pointer list for humans.
 
-- `outline.md` — Human intent (what/why). **Not executable.**
-- `README.md` — Clone landing: what it is / is not, `cargo test`, pointers to outline + live waves.
-- `waves.md` — **Only live contract:** locks, parked gaps, named tests (matched sets for done layers). No remaining coding-wave I/O/B.
-- `waves-done.md` — Archive of done **L1–L6 / I1–I7 / R1–R6 / O1–O5** full I/O/B. **Not executable.** Do not start those waves; they are `done`.
-- `choices.md` — Unanswered product picks only. Do not implement from it.
-- `assumption.md` — Confirmed = one-liners that **point** at `waves.md`; Unconfirmed = stop-signs. Not a third lock novel.
-- `problems.md` — Open engineering defects with **Solution:** (blank if Developer must choose).
-- `handoff.md` — Resume stub: last finished wave + unique host/CI gotchas. Not a wave diary.
-- `kmod/stardust-kmdf/README.md` — Windows driver operator recipe.
+- `README.md` (git root) — Clone landing: two workspaces (`stardust/`, `stardust-ui/`).
+- `stardust/outline.md` — Human intent (what/why). **Not executable.**
+- `stardust/README.md` — Library: what it is / is not, layers, syntax (`.sd` / dumpable IR / Rust builder), `cargo test`.
+- `stardust/waves.md` — **Live contract** (locks, parked gaps, named tests) plus **Archive (not executable)** of done **L1–L6 / I1–I7 / R1–R6 / O1–O8** full I/O/B. Do not start archived waves; they are `done`. No remaining coding-wave I/O/B.
+- `stardust/assumption.md` — Confirmed = one-liners that **point** at `waves.md`; Unconfirmed = unanswered picks (including G1–G5). Not a third lock novel.
+- `stardust/handoff.md` — Library resume stub (GNU linker, libffi, last wave).
+- `stardust/kmod/stardust-kmdf/README.md` — Windows driver operator recipe.
+- `stardust-ui/StarDust UI.md` — UI contract. Drive: `stardust-ui/desktop-drive.md`. Resume: `stardust-ui/handoff.md`.
 - `.cursor/rules/*.mdc` — Process only, not product.
+
+Unanswered picks stay in `stardust/assumption.md` Unconfirmed and the [stardust/waves.md](stardust/waves.md) OOP lock. Open engineering gaps stay under Gaps parked in `stardust/waves.md`.
 
 Do **not** create `specification.md` or a `docs/` tree unless Developer asks.
 
 ## ID namespaces
 
-- Live remaining waves: **none.** Archive **L1–L6**, **I1–I7**, **R1–R6**, and **O1–O5** in `waves-done.md`.
-- Archive G1–G7 (in `waves-done.md` only): old aliases I5, I6, L3, L4, L5, R4, R5.
-- `choices.md` G1–G5: OOP extras (private fields, static, abstract, `super`, StarDust bodies).
-- Integration tests: `tests/layout.rs`, `tests/import.rs`, `tests/region.rs`, plus feature-gated `python` / `llvm` / `haskell` / `lean` / `linux_module` / `kmdf` / `attach`. Never O-wave ids. **Never name a test target, module, or function `index`.** Docs may say “matched sets” or “named tests,” not “index” as a code name.
+- Live remaining waves: **none.** Archive **L1–L6**, **I1–I7**, **R1–R6**, and **O1–O8** in the `stardust/waves.md` Archive section.
+- Archive G1–G7 (in the `stardust/waves.md` Archive only): old aliases I5, I6, L3, L4, L5, R4, R5.
+- OOP extras G1–G5 (private fields, static, abstract, `super`, StarDust bodies): unanswered in `stardust/assumption.md` Unconfirmed and the `stardust/waves.md` OOP lock (G1–G2 blank, G3/G4 later, G5 ask later).
+- Integration tests: `stardust/tests/layout.rs`, `stardust/tests/import.rs`, `stardust/tests/region.rs`, plus feature-gated `python` / `llvm` / `haskell` / `linux_module` / `kmdf` / `attach`. Never O-wave ids. **Never name a test target, module, or function `index`.** Docs may say “matched sets” or “named tests,” not “index” as a code name.
 
 ## When to edit
 
-- **Before code:** fill Review gates, accept/drop/reorder remaining waves, move a pick from `choices.md` into `waves.md` Locks.
-- **After a named wave is `done`:** move that wave’s full I/O/B from `waves.md` into `waves-done.md`; add its named tests to the live matched-set list; drop the resolved `problems.md` row if any.
+- **Before code:** fill Review gates, accept/drop/reorder remaining waves, move a pick from `stardust/assumption.md` Unconfirmed into `stardust/waves.md` Locks.
+- **After a named wave is `done`:** append that wave’s full I/O/B to the `stardust/waves.md` Archive section; add its named tests to the live matched-set list.
 - Do **not** update docs as a substitute for executing a named wave.
 
 ## Read path
 
-- **Human:** `README.md` → `outline.md` → `waves.md` (locks + parked gaps + named tests) → unanswered `choices.md` → `problems.md`.
-- **Agent executing a named wave:** that wave’s I/O/B in `waves-done.md` + Locks + that Review gate + the live named-test list. Open `waves-done.md` when changing a done layer or chasing a named L/I/R/O test. There is currently no remaining coding wave.
+- **Human:** git-root `README.md` → `stardust/outline.md` → `stardust/waves.md` (locks + parked gaps + named tests). UI: `stardust-ui/StarDust UI.md`.
+- **Agent executing a named wave:** that wave’s I/O/B in the `stardust/waves.md` Archive + Locks + that Review gate + the live named-test list. Open the Archive section when changing a done layer or chasing a named L/I/R/O test. There is currently no remaining coding wave.
 
-## Hygiene (problems / assumption / handoff)
+## Hygiene (assumption / handoff)
 
-Whenever you update `problems.md`, `assumption.md`, or `handoff.md`:
+Whenever you update `stardust/assumption.md` or a `handoff.md`:
 
 1. **No datetimes.** Mark the newest finished task or newly added assumption with **`(Latest)`** (only one `(Latest)` per file section where it applies).
-2. **Merge resolved problems.** Fold durable outcomes into `waves.md` Locks or a short `handoff.md` gotcha, then drop the `problems.md` row.
+2. Fold durable outcomes into `stardust/waves.md` Locks or a short `handoff.md` gotcha.
 3. **Delete outdated noise.** Prefer a short useful document over a complete diary.
 
 Finished work in `handoff.md` needs no empty **Remaining** / **Notes**; omit those sections when nothing is left. Active work uses Done / Remaining / Notes.
@@ -53,23 +54,6 @@ Finished work in `handoff.md` needs no empty **Remaining** / **Notes**; omit tho
 ## assumption.md
 
 - **Two groups only:** `## Confirmed` and `## Unconfirmed`.
-- **Confirmed:** one bullet per lock. Point at `waves.md` for detail. Do not reprint done-wave I/O/B.
+- **Confirmed:** one bullet per lock. Point at `stardust/waves.md` for detail. Do not reprint done-wave I/O/B.
 - **Unconfirmed:** open choices Developer has not locked.
 - When a lock is overturned, **delete** the old row and put the new rule in Confirmed.
-
-## problems.md
-
-Authoritative **open/deferred** problem list. Reconcile with `waves.md`, `assumption.md`, and the code.
-
-For each **open** or **deferred** problem, always include a **Solution:** field.
-
-- If there is **one** clear agreed or obvious fix path, state it briefly (approach, key files/APIs, acceptance link).
-- If there is **no** known solution, or **multiple** plausible solutions that need a product choice, leave the field **blank**:
-
-```markdown
-**Solution:**
-```
-
-Do **not** invent a fake single solution, silently pick among alternatives, or omit the field. Do not fill the blank with “TBD” or agent speculation.
-
-Resolved rows do not need a Solution field. On resolve: merge durable outcome, then drop the row.

@@ -1,11 +1,14 @@
 ---
-description: StarDust UI config stays in AppData; Cursor may access AppData; in-app agent lock is separate
+description: StarDust UI config stays in AppData; Cursor must ask before any AppData edit
 alwaysApply: true
 ---
 
-# StarDust UI: config store location (not a Cursor AppData ban)
+# StarDust UI: config store location (ask before AppData edits)
 
-Cursor agents may read, write, search, and edit Windows AppData (Roaming, Local, LocalLow), including `%APPDATA%\StarDust`. This file is not a tool or filesystem prohibition.
+This file is not a tool or filesystem prohibition. Keep UI state at `%APPDATA%\StarDust` (layout, mode, history, WebView2 profile). Do not put that store in the git repo or change `config_dir()` / `layout_file()` off APPDATA.
 
-- Keep UI state at `%APPDATA%\StarDust` (layout, mode, history, WebView2 profile). Do not put that store in the git repo or change `config_dir()` / `layout_file()` off APPDATA.
-- The StarDust **in-app** agent has its own hidden AppData lock (sidecar / first-turn hint; see `StarDust UI.md` and `desktop-drive.md`). Cursor is **not** bound by that lock.
+- **Read** Windows AppData (Roaming, Local, LocalLow), including `%APPDATA%\StarDust`, is allowed without asking.
+- **Edit** (Write, Shell that mutates, copy, delete, rename, move, create) under those trees: **ask first**, every time — path, what will change, and why. Do not edit until Developer answers yes. Do not treat a prior yes as a session-wide pass.
+- The StarDust **in-app** agent has its own hidden AppData lock (sidecar / first-turn hint; see `stardust-ui/StarDust UI.md` and `stardust-ui/desktop-drive.md`). That lock is not Cursor’s permission to write without asking.
+
+Example: do not Write `%APPDATA%\StarDust\ui-mode.json` to flip UI mode. Ask: “May I set `ui-mode.json` mode to windows?” Wait for yes.

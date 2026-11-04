@@ -5,6 +5,11 @@ stardust-ui/target
 stardust-ui/.env
 __pycache__/
 *.pyc
+*.png
+*.md
+stardust-ui/boot-debug.txt
+stardust-ui/host-err.txt
+stardust-ui/host-out.txt
 stardust-ui/agent/node_modules
 stardust/kmod/stardust/*.o
 stardust/kmod/stardust/*.ko

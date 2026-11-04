@@ -1,0 +1,58 @@
+endian little
+bit_order lsb0
+
+layout EthFrameLay repr_c {
+  kind: u16;
+  length: u16;
+  checksum: u32;
+  note: [u8; 32];
+  proto: link;
+  dst: [u8; 6];
+  src: [u8; 6];
+}
+
+layout FrameLay repr_c {
+  kind: u16;
+  length: u16;
+  checksum: u32;
+  note: [u8; 32];
+  proto: link;
+}
+
+layout ProtocolLay repr_c {
+  count: u32;
+  digest: u32;
+  rows: [struct repr_c {
+    code: u16;
+    name: [u8; 8];
+  }; 4];
+}
+
+class EthFrame {
+  layout EthFrameLay;
+  base Frame;
+  method parse(ptr, len) -> void {
+    symbol parse_eth;
+    lang rust;
+  }
+}
+
+class Frame {
+  layout FrameLay;
+  method explain(ptr, len) -> void {
+    symbol explain;
+    lang python;
+  }
+  method parse(ptr, len) -> void {
+    symbol parse_frame;
+    lang c;
+  }
+}
+
+class ProtocolDb {
+  layout ProtocolLay;
+  >> seal(ptr, len) -> void {
+    symbol seal_db;
+    lang c;
+  }
+}

@@ -61,12 +61,13 @@
     }
   }
 
-  async function apiJSON(method, url, body, timeoutMs) {
+  async function apiJSON(method, url, body, timeoutMs, extra) {
     const opts = { method, headers: {} };
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
     }
+    if (extra && extra.keepalive) opts.keepalive = true;
     let timer = 0;
     if (timeoutMs > 0 && typeof AbortController !== "undefined") {
       const ac = new AbortController();
@@ -113,7 +114,7 @@
       : (data && (data.entries || data.children || data.nodes)) || [];
     return list.map((e) => {
       const kind = e.kind === "dir" || e.kind === "directory" || e.isDir ? "dir" : "file";
-      return {
+      const row = {
         name: e.name || e.fileName || baseName(e.path),
         path: e.path || joinPath(dirPath, e.name || e.fileName),
         kind,
@@ -121,6 +122,10 @@
         mtime: e.mtime,
         isText: kind === "dir" ? undefined : e.isText,
       };
+      if (typeof e.logo === "string" && e.logo) {
+        row.logo = e.logo;
+      }
+      return row;
     });
   }
 
@@ -136,13 +141,13 @@
     agentOpen: true,
     agentWidth: 380,
     agentModel: "composer-2.5",
-    sortMode: "galaxy",
+    layoutMode: "galaxy",
     views: [],
     split: null,
     focusedViewId: null,
     focusHist: [],
     pins: [],
-    starPos: { "2d": {}, "3d": {} },
+    starPos: { "2d": {}, "3d": {}, "2dGrid": {}, "3dGrid": {} },
     starLooks: {},
     threads: [],
     fileClip: null,
@@ -204,9 +209,7 @@
   }
 
   function applyShellClass() {
-    const q = new URLSearchParams(location.search || "");
-    const desk = q.get("desktop") === "1" || !!q.get("open") || state.uiMode === "stardust";
-    document.documentElement.classList.toggle("shell-desktop", desk);
+    document.documentElement.classList.toggle("shell-desktop", state.uiMode === "stardust");
   }
 
   function collectLayout() {
@@ -215,8 +218,11 @@
       agentOpen: state.agentOpen,
       agentWidth: state.agentWidth,
       agentModel: state.agentModel,
-      sortMode: state.sortMode,
-      views: state.views.map((v) => {
+      layout: state.layoutMode === "grid" ? "grid" : "galaxy",
+      gridPack: 2,
+      views: state.views
+        .filter((v) => !v.windowDock)
+        .map((v) => {
         if (v.cns) {
           return {
             id: v.id,
@@ -238,7 +244,7 @@
         windowDock: !!v.windowDock,
         };
       }),
-      split: serializeSplit(state.split),
+      split: serializeSplit(pruneDockLeaves(state.split)),
       floats: SD.editor ? SD.editor.serialize() : [],
       pins: state.pins,
       starPos: normalizeStarPos(state.starPos),
@@ -308,6 +314,29 @@
     };
   }
 
+  function pruneDockLeaves(node) {
+    if (!node) return null;
+    if (node.type === "leaf") {
+      const v = viewById(node.viewId);
+      return v && v.windowDock ? null : node;
+    }
+    const a = pruneDockLeaves(node.a);
+    const b = pruneDockLeaves(node.b);
+    if (!a) return b;
+    if (!b) return a;
+    return { type: "split", axis: splitAxisOf(node), ratio: node.ratio, a, b };
+  }
+
+  function pruneMissingViews(node) {
+    if (!node) return null;
+    if (node.type === "leaf") return viewById(node.viewId) ? node : null;
+    const a = pruneMissingViews(node.a);
+    const b = pruneMissingViews(node.b);
+    if (!a) return b;
+    if (!b) return a;
+    return { type: "split", axis: splitAxisOf(node), ratio: node.ratio, a, b };
+  }
+
   function viewById(id) {
     return state.views.find((v) => v.id === id);
   }
@@ -329,10 +358,19 @@
     return view && (viewMode(view) === "3d" ? view.cosmos3 : view.cosmos2);
   }
   function viewMode(view) {
-    return view && view.mode === "3d" ? "3d" : "2d";
+    return "2d";
+  }
+
+  function migrateLayoutMode(saved) {
+    if (saved && (saved.layout === "grid" || saved.layout === "galaxy")) return saved.layout;
+    const sm = saved && saved.sortMode;
+    if (sm === "name" || sm === "type" || sm === "size" || sm === "grid") return "grid";
+    return "galaxy";
   }
   function posBag(view) {
-    return viewMode(view) === "3d" ? state.starPos["3d"] : state.starPos["2d"];
+    const dim = viewMode(view) === "3d" ? "3d" : "2d";
+    const key = state.layoutMode === "grid" ? dim + "Grid" : dim;
+    return state.starPos[key] || (state.starPos[key] = {});
   }
 
   function pathKey(p) {
@@ -360,6 +398,8 @@
     return {
       "2d": collapsePosBag(src["2d"] || src.positions2d || {}),
       "3d": collapsePosBag(src["3d"] || src.positions3d || {}),
+      "2dGrid": collapsePosBag(src["2dGrid"] || {}),
+      "3dGrid": collapsePosBag(src["3dGrid"] || {}),
     };
   }
 
@@ -369,6 +409,8 @@
     return {
       "2d": Object.assign({}, a["2d"], b["2d"]),
       "3d": Object.assign({}, a["3d"], b["3d"]),
+      "2dGrid": Object.assign({}, a["2dGrid"], b["2dGrid"]),
+      "3dGrid": Object.assign({}, a["3dGrid"], b["3dGrid"]),
     };
   }
 
@@ -400,6 +442,28 @@
     return map;
   }
 
+  function pruneStarPosToListing(dirPath, children, error) {
+    if (error || !dirPath || !state.starPos) return;
+    const names = new Set((children || []).map((c) => c && c.name).filter(Boolean));
+    let dropped = false;
+    ["2d", "3d", "2dGrid", "3dGrid"].forEach((mode) => {
+      const bag = state.starPos[mode];
+      const map = dirPositions(bag, dirPath);
+      if (!map) return;
+      const live = {};
+      let gone = false;
+      Object.keys(map).forEach((k) => {
+        if (names.has(k)) live[k] = map[k];
+        else gone = true;
+      });
+      if (gone) {
+        storeDirPositions(bag, dirPath, live);
+        dropped = true;
+      }
+    });
+    if (dropped) scheduleSave();
+  }
+
   function focusView(view) {
     if (!view || view.minimized) return;
     state.focusedViewId = view.id;
@@ -411,6 +475,7 @@
     refreshModeButton();
     refreshEditMenu();
     paintPinStars();
+    paintStatus();
     syncSearchPlaceholder();
   }
 
@@ -438,6 +503,16 @@
       brand.title = label;
       brand.setAttribute("aria-label", label);
     }
+    const field = $("#menu-view .menu-layout-field");
+    const cur = state.layoutMode === "grid" ? "grid" : "galaxy";
+    const words = field
+      ? field.querySelectorAll("[data-cmd]")
+      : $$('#menu-view [data-cmd="grid"], #menu-view [data-cmd="galaxy"]');
+    words.forEach((b) => {
+      const on = b.dataset.cmd === cur;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    });
   }
 
   function refreshEditMenu() {
@@ -588,6 +663,7 @@
         view.selection = stars;
         focusView(view);
         refreshEditMenu();
+        paintStatus();
         if (view.cns && stars && stars[0] && stars[0].role !== "cluster") {
           showCnsDetail(view, stars[0].name, false);
         }
@@ -779,8 +855,12 @@
       await loadCnsStars(view, opts);
       return;
     }
+    const prev = view.cosmos;
     const c0 = await ensureEngine(view);
     view.cosmos = c0;
+    if (!opts.resetCamera && c0 && c0.getCamera && view._sceneReady && prev === c0) {
+      view.camera = c0.getCamera();
+    }
     if (c0 && c0.setScene) c0.setScene({ dirPath: view.path, loading: true, children: [] });
     let kids = [];
     let error = "";
@@ -802,6 +882,7 @@
     } catch (e) {
       error = errText(e);
     }
+    pruneStarPosToListing(view.path, kids, error);
     const c = await ensureEngine(view);
     view.cosmos = c;
     if (c) {
@@ -812,9 +893,10 @@
         looks: state.starLooks,
         camera: opts.resetCamera ? undefined : view.camera,
         resetCamera: !!opts.resetCamera,
+        layoutMode: state.layoutMode === "grid" ? "grid" : "galaxy",
         error,
       });
-      if (state.sortMode && state.sortMode !== "galaxy") c.arrangeBy(state.sortMode);
+      view._sceneReady = true;
     }
     view.itemCount = kids.length;
     paintCrumbs(view);
@@ -977,6 +1059,13 @@
     el.className = "cview";
     el.dataset.id = v.id;
     if (v.windowDock) el.classList.add("window-dock");
+    if (v.windowDock) {
+      el.innerHTML = '<div class="vstage"><div class="vcosmos"></div></div>';
+      parent.appendChild(el);
+      v.rootEl = el;
+      v.stage = el.querySelector(".vstage");
+      return;
+    }
     el.innerHTML =
       '<header class="vhead"><div class="crumbs"></div><div class="vbtns">' +
       '<button type="button" data-act="pin-temp" title="Minimize">–</button>' +
@@ -1031,6 +1120,18 @@
     paintCloseButtons();
   }
 
+  function applySplitFlex(el, grow) {
+    if (!el) return;
+    el.style.flexGrow = String(grow);
+    el.style.flexShrink = "1";
+    el.style.flexBasis = "0px";
+    el.style.minWidth = "0";
+    el.style.minHeight = "0";
+    el.style.overflow = "hidden";
+    el.style.display = "flex";
+  }
+
+  let splitSashDrag = false;
   function renderSplit(node, host) {
     host.innerHTML = "";
     function paint(n, into) {
@@ -1043,34 +1144,36 @@
       const row = document.createElement("div");
       row.className = axis === "y" ? "split-node axis-y" : "split-node col axis-x";
       const a = document.createElement("div");
-      a.style.flex = String(n.ratio);
-      a.style.minWidth = "0";
-      a.style.minHeight = "0";
-      a.style.display = "flex";
+      applySplitFlex(a, n.ratio);
       const sash = document.createElement("div");
       sash.className = "sash";
       const b = document.createElement("div");
-      b.style.flex = String(1 - n.ratio);
-      b.style.minWidth = "0";
-      b.style.minHeight = "0";
-      b.style.display = "flex";
+      applySplitFlex(b, 1 - n.ratio);
       row.append(a, sash, b);
       into.appendChild(row);
       paint(n.a, a);
       paint(n.b, b);
       sash.addEventListener("pointerdown", (e) => {
         const r = row.getBoundingClientRect();
+        splitSashDrag = true;
+        postSashDrag(true);
         function mv(ev) {
           const t = axis === "y" ? (ev.clientY - r.top) / r.height : (ev.clientX - r.left) / r.width;
           n.ratio = Math.max(0.15, Math.min(0.85, t));
-          a.style.flex = String(n.ratio);
-          b.style.flex = String(1 - n.ratio);
+          applySplitFlex(a, n.ratio);
+          applySplitFlex(b, 1 - n.ratio);
+          scheduleDockPlace(state.split);
         }
         function up() {
           window.removeEventListener("pointermove", mv);
           window.removeEventListener("pointerup", up);
           scheduleSave();
           resizeViews();
+          placeDocksInTree(state.split);
+          requestAnimationFrame(() => {
+            splitSashDrag = false;
+            postSashDrag(false);
+          });
         }
         window.addEventListener("pointermove", mv);
         window.addEventListener("pointerup", up);
@@ -1156,38 +1259,479 @@
     return nv;
   }
 
-  function dockView() {
-    return (state.views || []).find((v) => v && v.windowDock && !v.minimized) || null;
-  }
-
   function cosmosPeekEl(view) {
     return (view && view.rootEl && view.rootEl.querySelector(".vcosmos")) || null;
   }
 
   function cosmosPeekRect() {
-    const view = dockView() || focusedView();
+    const focused = focusedView();
+    const view =
+      (focused && !focused.windowDock && focused) ||
+      (state.views || []).find((v) => v && !v.minimized && !v.windowDock) ||
+      null;
     if (!view) return null;
     const el = cosmosPeekEl(view);
     if (!el || typeof el.getBoundingClientRect !== "function") return null;
     const r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) return null;
     return {
-      x: Math.round((window.screenX || window.screenLeft || 0) + r.left),
-      y: Math.round((window.screenY || window.screenTop || 0) + r.top),
+      x: Math.round(r.left),
+      y: Math.round(r.top),
       w: Math.round(r.width),
       h: Math.round(r.height),
+      innerW: Math.round(window.innerWidth || 1),
+      innerH: Math.round(window.innerHeight || 1),
     };
   }
 
   let peekSlotKey = "";
   let peekSlotRaf = 0;
+  let dockPanesKey = "";
+  let lastPaneInnerW = 0;
+  let userDockDragging = false;
   function postPeekSlot() {
     const rect = cosmosPeekRect();
     if (!rect) return;
-    const key = rect.x + "," + rect.y + "," + rect.w + "," + rect.h;
+    const key =
+      rect.x +
+      "," +
+      rect.y +
+      "," +
+      rect.w +
+      "," +
+      rect.h +
+      "," +
+      (rect.innerW || 0) +
+      "," +
+      (rect.innerH || 0);
     if (key === peekSlotKey) return;
     peekSlotKey = key;
     api.post("/api/drive", { op: "peek-slot", args: rect }).catch(() => {});
+  }
+
+  function paneBoxRect(el) {
+    if (!el || typeof el.getBoundingClientRect !== "function") return null;
+    let r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) {
+      const cell = el.parentElement;
+      if (cell && typeof cell.getBoundingClientRect === "function") {
+        const cr = cell.getBoundingClientRect();
+        if (cr.width >= 8 && cr.height >= 8) r = cr;
+      }
+    }
+    if (r.width < 8 || r.height < 8) return null;
+    return r;
+  }
+
+  function paneCssRect(view) {
+    const el = view && view.rootEl;
+    const r = paneBoxRect(el);
+    if (!r) return null;
+    return {
+      viewId: view.id,
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+      innerW: Math.round(window.innerWidth || 1),
+      innerH: Math.round(window.innerHeight || 1),
+    };
+  }
+
+  function waitPaneRect(view) {
+    return new Promise((resolve) => {
+      const tick = (n) => {
+        if (view && view.rootEl) void view.rootEl.offsetHeight;
+        const rect = paneCssRect(view);
+        if (rect || n <= 0) return resolve(rect);
+        requestAnimationFrame(() => tick(n - 1));
+      };
+      requestAnimationFrame(() => tick(16));
+    });
+  }
+
+  function postDockPanes() {
+    const innerW = Math.round(window.innerWidth || 1);
+    const innerH = Math.round(window.innerHeight || 1);
+    const focusedViewId = state.focusedViewId || "";
+    const panes = (state.views || [])
+      .filter((v) => v && !v.minimized && v.rootEl)
+      .map((v) => {
+        const r = paneBoxRect(v.rootEl);
+        if (!r) return null;
+        return {
+          viewId: v.id,
+          x: Math.round(r.left),
+          y: Math.round(r.top),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+        };
+      })
+      .filter(Boolean);
+    const key =
+      innerW +
+      "," +
+      innerH +
+      ";" +
+      focusedViewId +
+      ";" +
+      panes.map((p) => p.viewId + ":" + p.x + "," + p.y + "," + p.w + "," + p.h).join("|");
+    if (lastPaneInnerW && innerW < lastPaneInnerW * 0.9) return Promise.resolve();
+    if (key === dockPanesKey) return Promise.resolve();
+    dockPanesKey = key;
+    lastPaneInnerW = innerW;
+    capturePanePreviewCells();
+    return api
+      .post("/api/drive", { op: "peek-panes", args: { panes, innerW, innerH, focusedViewId } })
+      .catch(() => {});
+  }
+
+  const DOCK_SASH_PX = 5;
+  const CVIEW_MARGIN_PX = 4;
+  function cviewMarginPx() {
+    return document.documentElement.classList.contains("shell-desktop") ? 0 : CVIEW_MARGIN_PX;
+  }
+  let panePreviewCells = {};
+  function capturePanePreviewCells() {
+    const next = {};
+    (state.views || []).forEach((v) => {
+      const cell = v && v.rootEl && v.rootEl.parentElement;
+      if (!cell || typeof cell.getBoundingClientRect !== "function") return;
+      const r = cell.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return;
+      next[v.id] = {
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height,
+      };
+    });
+    panePreviewCells = next;
+  }
+  function dockLeafRect(cell, edge) {
+    if (!cell) return null;
+    const sash = DOCK_SASH_PX;
+    const m = cviewMarginPx();
+    const x = cell.left;
+    const y = cell.top;
+    const w = cell.width;
+    const h = cell.height;
+    if (edge === "left" || edge === "right") {
+      const leaf = Math.max(0, (w - sash) / 2);
+      const top = y + m;
+      const height = Math.max(0, h - 2 * m);
+      const width = Math.max(0, leaf - 2 * m);
+      if (edge === "left") return { left: x + m, top, width, height };
+      return { left: x + leaf + sash + m, top, width, height };
+    }
+    if (edge === "top" || edge === "bottom") {
+      const leaf = Math.max(0, (h - sash) / 2);
+      const left = x + m;
+      const width = Math.max(0, w - 2 * m);
+      const height = Math.max(0, leaf - 2 * m);
+      if (edge === "top") return { left, top: y + m, width, height };
+      return { left, top: y + leaf + sash + m, width, height };
+    }
+    return null;
+  }
+
+  function previewCellFor(view) {
+    if (view && panePreviewCells[view.id]) return panePreviewCells[view.id];
+    const el = view && (view.rootEl && (view.rootEl.parentElement || view.rootEl));
+    if (!el || typeof el.getBoundingClientRect !== "function") return null;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return null;
+    return { left: r.left, top: r.top, width: r.width, height: r.height };
+  }
+
+  function cssDockArgs(box, hwndId, viewId) {
+    if (!box) return null;
+    return {
+      id: hwndId,
+      viewId: viewId || "",
+      x: Math.round(box.left),
+      y: Math.round(box.top),
+      w: Math.round(box.width),
+      h: Math.round(box.height),
+      innerW: Math.round(window.innerWidth || 1),
+      innerH: Math.round(window.innerHeight || 1),
+    };
+  }
+
+  let userDockPreviewOn = false;
+  let userDockPreviewSig = "";
+  function layoutUserDockPreview(on, edge, view) {
+    const el = $("#user-dock-preview");
+    if (!el) return;
+    if (!on || !edge) {
+      document.documentElement.classList.remove("user-dock-hover");
+      if (userDockPreviewOn) {
+        el.hidden = true;
+        userDockPreviewOn = false;
+        userDockPreviewSig = "";
+      }
+      return;
+    }
+    const cell = previewCellFor(view);
+    const box = dockLeafRect(cell, edge);
+    if (!box || box.width < 8 || box.height < 8) {
+      layoutUserDockPreview(false);
+      return;
+    }
+    const left = Math.round(box.left);
+    const top = Math.round(box.top);
+    const width = Math.round(box.width);
+    const height = Math.round(box.height);
+    const sig = left + "," + top + "," + width + "," + height;
+    document.documentElement.classList.add("user-dock-hover");
+    if (userDockPreviewOn && userDockPreviewSig === sig) return;
+    el.style.left = left + "px";
+    el.style.top = top + "px";
+    el.style.width = width + "px";
+    el.style.height = height + "px";
+    el.hidden = false;
+    userDockPreviewOn = true;
+    userDockPreviewSig = sig;
+  }
+
+  function setMotionFrozen(on) {
+    const next = !!on;
+    if (window.SD) window.SD.motionFrozen = next;
+    if (window.SDSky) window.SDSky.frozen = next;
+    (state.views || []).forEach((v) => {
+      const live = cosmosOf(v);
+      if (live && live.setLive) live.setLive(!next);
+    });
+  }
+
+  function ensureDockOnEdge(view, edge) {
+    if (state.uiMode !== "stardust") return null;
+    if (!view) return null;
+    const dock = makeView(view.root, view.path);
+    dock.windowDock = true;
+    const leaf = findLeaf(state.split, view.id);
+    const dockLeaf = { type: "leaf", viewId: dock.id };
+    const orig = { type: "leaf", viewId: view.id };
+    let neu;
+    if (edge === "right") {
+      neu = { type: "split", axis: "x", ratio: 0.5, a: orig, b: dockLeaf };
+    } else if (edge === "top") {
+      neu = { type: "split", axis: "y", ratio: 0.5, a: dockLeaf, b: orig };
+    } else if (edge === "bottom") {
+      neu = { type: "split", axis: "y", ratio: 0.5, a: orig, b: dockLeaf };
+    } else {
+      neu = { type: "split", axis: "x", ratio: 0.5, a: dockLeaf, b: orig };
+    }
+    if (!leaf) state.split = neu;
+    else state.split = replaceNode(state.split, leaf, neu);
+    remount();
+    if (!view.windowDock) focusView(view);
+    else focusView(latestUnminimized(dock) || view);
+    return dock;
+  }
+
+  function leafViewIds(node, out) {
+    const acc = out || [];
+    if (!node) return acc;
+    if (node.type === "leaf") {
+      acc.push(node.viewId);
+      return acc;
+    }
+    leafViewIds(node.a, acc);
+    leafViewIds(node.b, acc);
+    return acc;
+  }
+
+  function findSplitParent(node, viewId) {
+    if (!node || node.type !== "split") return null;
+    if (
+      (node.a && node.a.type === "leaf" && node.a.viewId === viewId) ||
+      (node.b && node.b.type === "leaf" && node.b.viewId === viewId)
+    ) {
+      return node;
+    }
+    return findSplitParent(node.a, viewId) || findSplitParent(node.b, viewId);
+  }
+
+  let dockPlaceRaf = 0;
+  function postSashDrag(on) {
+    api.post("/api/drive", { op: "user-sash", args: { drag: !!on } }).catch(() => {});
+  }
+  function scheduleDockPlace(node) {
+    if (dockPlaceRaf) return;
+    dockPlaceRaf = requestAnimationFrame(() => {
+      dockPlaceRaf = 0;
+      placeDocksInTree(node || state.split);
+    });
+  }
+
+  function placeDocksInTree(node) {
+    postDockPanes();
+    leafViewIds(node).forEach((id) => {
+      const v = viewById(id);
+      if (v && v.windowDock && v.dockHwnd) placeDockHwnd(v);
+    });
+  }
+
+  function placeDockHwnd(v) {
+    const rect = paneCssRect(v);
+    if (!rect || !v.dockHwnd) return;
+    if (Number(v.dockHwnd) === Number(dockSizingHwnd) && !splitSashDrag) return;
+    api
+      .post("/api/drive", { op: "user-dock", args: Object.assign({ id: v.dockHwnd, viewId: v.id }, rect) })
+      .catch(() => {});
+  }
+
+  function applyHwndResize(r) {
+    if (!r) return;
+    const v = (state.views || []).find(
+      (x) => x && (x.id === r.viewId || Number(x.dockHwnd) === Number(r.id))
+    );
+    if (!v || !v.rootEl) return;
+    const wrap = v.rootEl.parentElement;
+    const row = wrap && wrap.parentElement;
+    if (!row || !row.classList.contains("split-node")) return;
+    const a = row.children[0];
+    const sash = row.children[1];
+    const b = row.children[2];
+    if (!a || !b) return;
+    const axisY = row.classList.contains("axis-y");
+    const box = row.getBoundingClientRect();
+    const sashSize = sash ? (axisY ? sash.offsetHeight : sash.offsetWidth) : 0;
+    const total = (axisY ? box.height : box.width) - sashSize;
+    if (total < 8) return;
+    const size = axisY ? Number(r.h) : Number(r.w);
+    if (!Number.isFinite(size) || size < 8) return;
+    const isA = wrap === a;
+    let ratio = isA ? size / total : 1 - size / total;
+    ratio = Math.max(0.15, Math.min(0.85, ratio));
+    const node = findSplitParent(state.split, v.id);
+    if (node) node.ratio = ratio;
+    applySplitFlex(a, ratio);
+    applySplitFlex(b, 1 - ratio);
+    if (v.cosmos2) v.cosmos2.resize();
+    const other = isA
+      ? (state.views || []).find((x) => x && x.rootEl && b.contains(x.rootEl))
+      : (state.views || []).find((x) => x && x.rootEl && a.contains(x.rootEl));
+    if (other && other.cosmos2) other.cosmos2.resize();
+    if (other && other.cosmos3) other.cosmos3.resize();
+    if (v.cosmos3) v.cosmos3.resize();
+    scheduleDockPlace(state.split);
+  }
+
+  function viewForDockRow(row) {
+    if (!row) return null;
+    const id = Number(row.id);
+    return (
+      (state.views || []).find((x) => x && (x.id === row.viewId || Number(x.dockHwnd) === id)) || null
+    );
+  }
+
+  let userDockBusy = false;
+  let userDockHot = false;
+  let userDockTimer = 0;
+  let dockSizingHwnd = 0;
+  function userDockPollMs() {
+    return userDockHot ? 50 : 140;
+  }
+  function scheduleUserDockPoll() {
+    clearTimeout(userDockTimer);
+    userDockTimer = setTimeout(() => {
+      pollUserDock().finally(scheduleUserDockPoll);
+    }, userDockPollMs());
+  }
+  async function pollUserDock() {
+    if (userDockBusy) return;
+    userDockBusy = true;
+    try {
+      if (!userDockDragging) await postDockPanes();
+      const data = await api.post("/api/drive", { op: "user-dock-state", args: {} });
+      if (!data || data.ok === false) {
+        layoutUserDockPreview(false);
+        userDockHot = false;
+        userDockDragging = false;
+        return;
+      }
+      if (state.uiMode !== "stardust") {
+        layoutUserDockPreview(false);
+        userDockHot = false;
+        userDockDragging = false;
+        const gone = []
+          .concat(Array.isArray(data.splitUndock) ? data.splitUndock : [])
+          .concat(Array.isArray(data.dead) ? data.dead : []);
+        gone.forEach((row) => {
+          const v = viewForDockRow(row);
+          if (v && v.windowDock) closeView(v);
+        });
+        if ((state.views || []).some((v) => v && v.windowDock)) undockAllOsDocks();
+        return;
+      }
+      userDockDragging = !!data.dragging;
+      const hovering = !!(data.hover && data.viewId);
+      userDockHot = !!(data.dragging || hovering || data.drop || data.resize);
+      const sizing = data.resize ? Number(data.resize.id) || 0 : 0;
+      const wasSizing = dockSizingHwnd;
+      dockSizingHwnd = sizing;
+      layoutUserDockPreview(hovering, data.hover || data.edge, viewById(data.viewId));
+      if (state.uiMode === "stardust" && data.drop && data.id) {
+        layoutUserDockPreview(false);
+        const target = viewById(data.viewId) || focusedView();
+        const edge = data.edge || data.hover || "left";
+        const preBox = dockLeafRect(previewCellFor(target), edge);
+        const preArgs = cssDockArgs(preBox, data.id, target && target.id);
+        if (preArgs && preArgs.w >= 8 && preArgs.h >= 8) {
+          await api.post("/api/drive", { op: "user-dock", args: preArgs }).catch(() => {});
+        }
+        const dock = ensureDockOnEdge(target, edge);
+        if (dock) {
+          resizeViews();
+          const rect = (await waitPaneRect(dock)) || preArgs;
+          dockPanesKey = "";
+          await postDockPanes();
+          const args = Object.assign({ id: data.id, viewId: dock.id }, rect || {});
+          const body = { op: "user-dock", args };
+          let placed = await api.post("/api/drive", body);
+          if (!placed || placed.ok === false) {
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const retry = paneCssRect(dock) || preArgs;
+            if (retry) {
+              placed = await api.post("/api/drive", {
+                op: "user-dock",
+                args: Object.assign({ id: data.id, viewId: dock.id }, retry),
+              });
+            }
+          }
+          if (placed && placed.ok !== false) {
+            dock.dockHwnd = Number((placed && placed.id) || data.id) || 0;
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            placeDockHwnd(dock);
+            await new Promise((resolve) => setTimeout(resolve, 160));
+            placeDockHwnd(dock);
+            scheduleSave();
+          }
+          await api.post("/api/drive", { op: "user-dock-ack", args: {} });
+          layoutUserDockPreview(false);
+        } else {
+          await api.post("/api/drive", { op: "user-dock-ack", args: {} });
+          layoutUserDockPreview(false);
+        }
+      }
+      const gone = splitSashDrag
+        ? []
+        : []
+        .concat(Array.isArray(data.splitUndock) ? data.splitUndock : [])
+        .concat(Array.isArray(data.dead) ? data.dead : []);
+      gone.forEach((row) => {
+        const v = viewForDockRow(row);
+        if (v && v.windowDock) closeView(v);
+      });
+      if (data.resize) applyHwndResize(data.resize);
+      else if (wasSizing) placeDocksInTree(state.split);
+    } catch (_) {
+      layoutUserDockPreview(false);
+    } finally {
+      userDockBusy = false;
+    }
   }
 
   function schedulePeekSlot() {
@@ -1195,6 +1739,7 @@
     peekSlotRaf = requestAnimationFrame(() => {
       peekSlotRaf = 0;
       postPeekSlot();
+      postDockPanes();
     });
   }
 
@@ -1216,7 +1761,14 @@
 
   function closeView(v) {
     if (!v || v.minimized) return;
-    if (!latestUnminimized(v)) return;
+    if (!latestUnminimized(v)) {
+      if (!v.windowDock) return;
+      const live = makeView(fillerRoot(), fillerRoot());
+      live.filler = true;
+      state.split = { type: "leaf", viewId: live.id };
+    }
+    const wasDock = !!v.windowDock;
+    const dockId = v.dockHwnd;
     state.pins = state.pins.filter((p) => !(p.kind === "view" && p.viewId === v.id && !p.permanent));
     discardView(v);
     if (!state.split) {
@@ -1231,6 +1783,40 @@
     focusView(latestUnminimized());
     syncWatches();
     scheduleSave();
+    if (wasDock && dockId) {
+      api.post("/api/drive", { op: "user-undock", args: { id: dockId } }).catch(() => {});
+    }
+  }
+
+  function closeDockViews(views) {
+    const seen = new Set();
+    const list = [];
+    (views || []).forEach((v) => {
+      if (!v || !v.windowDock || seen.has(v.id)) return;
+      seen.add(v.id);
+      list.push(v);
+    });
+    if (!list.length) return;
+    list.forEach((v) => {
+      state.pins = state.pins.filter((p) => !(p.kind === "view" && p.viewId === v.id && !p.permanent));
+      discardView(v);
+    });
+    if (!latestUnminimized() || !state.split) {
+      const live = makeView(fillerRoot(), fillerRoot());
+      live.filler = true;
+      state.split = { type: "leaf", viewId: live.id };
+    }
+    remount();
+    focusView(latestUnminimized());
+    syncWatches();
+    scheduleSave();
+  }
+
+  function undockAllOsDocks() {
+    layoutUserDockPreview(false);
+    setMotionFrozen(false);
+    api.post("/api/drive", { op: "user-undock", args: {} }).catch(() => {});
+    closeDockViews(state.views || []);
   }
 
   function fillerRoot() {
@@ -1616,9 +2202,10 @@
     await loadChildren(view);
   }
 
-  function startRename(view, star) {
+  function startRename(view, star, opts) {
     const c = cosmosOf(view);
     if (!c || !star) return;
+    const fromKey = !!(opts && opts.fromKey);
     const inp = $("#rename-overlay");
     const scr = c.screenOf(star);
     inp.hidden = false;
@@ -1626,15 +2213,18 @@
     inp.style.left = scr.x - 40 + "px";
     inp.style.top = scr.y + scr.r + 6 + "px";
     inp.style.width = Math.max(80, star.name.length * 8 + 24) + "px";
-    inp.focus();
-    inp.select();
     let finished = false;
+    let armed = false;
+    let bounces = 0;
+    let onUp = null;
     const finish = async (commit) => {
       if (finished) return;
       finished = true;
+      if (onUp) window.removeEventListener("keyup", onUp, true);
       inp.hidden = true;
       inp.onkeydown = null;
       inp.onblur = null;
+      inp.onmousedown = null;
       if (!commit) return;
       const name = inp.value.trim();
       if (!name || name === star.name) return;
@@ -1642,14 +2232,50 @@
       const ok = await mutate("rename", { from: star.path, to });
       if (ok) await loadChildren(view);
     };
+    const arm = () => {
+      if (finished) return;
+      inp.focus();
+      inp.select();
+      armed = true;
+    };
+    // F2 focuses this field while the key is still down. That blur hides it
+    // again in the same instant (the star blinks and the box is gone).
+    inp.onblur = () => {
+      if (finished) return;
+      if (!armed) {
+        if (bounces++ > 4) return;
+        setTimeout(() => {
+          if (!finished) {
+            inp.focus();
+            inp.select();
+          }
+        }, 0);
+        return;
+      }
+      finish(true);
+    };
+    inp.onmousedown = (e) => e.stopPropagation();
     inp.onkeydown = (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
         finish(true);
       }
-      if (e.key === "Escape") finish(false);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finish(false);
+      }
     };
-    inp.onblur = () => finish(true);
+    if (fromKey) {
+      onUp = (e) => {
+        if (e.key !== "F2") return;
+        window.removeEventListener("keyup", onUp, true);
+        onUp = null;
+        setTimeout(arm, 0);
+      };
+      window.addEventListener("keyup", onUp, true);
+    } else {
+      setTimeout(arm, 0);
+    }
   }
 
   async function showProps(star) {
@@ -2862,9 +3488,9 @@
 
   function rebuildCargoLine(features) {
     if (features && features.length) {
-      return "cargo build -p fs-viz --features " + features.join(",");
+      return "cargo build -p stardust-ui --features " + features.join(",");
     }
-    return "cargo build -p fs-viz";
+    return "cargo build -p stardust-ui";
   }
 
   async function runRebuildUi(opts) {
@@ -2937,14 +3563,17 @@
     }
   }
 
-  function arrangeAll(key) {
-    state.sortMode = key;
+  function setLayoutMode(mode) {
+    const next = mode === "grid" ? "grid" : "galaxy";
+    if (state.layoutMode === next) {
+      refreshViewMenu();
+      return;
+    }
+    state.layoutMode = next;
+    refreshViewMenu();
     state.views.forEach((v) => {
       if (v.cns) return;
-      const c = cosmosOf(v);
-      if (!c) return;
-      if (key === "galaxy") c.galaxy();
-      else c.arrangeBy(key);
+      loadChildren(v);
     });
     scheduleSave();
   }
@@ -2976,6 +3605,7 @@
       if (v.cosmos3) v.cosmos3.resize();
     });
     schedulePeekSlot();
+    scheduleDockPlace(state.split);
   }
 
   function bindMenus() {
@@ -3045,17 +3675,11 @@
       case "cascade":
         SD.editor.cascade();
         break;
-      case "sort-name":
-        arrangeAll("name");
-        break;
-      case "sort-type":
-        arrangeAll("type");
-        break;
-      case "sort-size":
-        arrangeAll("size");
+      case "grid":
+        setLayoutMode("grid");
         break;
       case "galaxy":
-        arrangeAll("galaxy");
+        setLayoutMode("galaxy");
         break;
       case "toggle-mode":
         setMode(viewMode(v) === "2d" ? "3d" : "2d", v);
@@ -3077,9 +3701,6 @@
         break;
       case "rebuild-ui-haskell":
         runRebuildUi({ features: ["haskell"] });
-        break;
-      case "rebuild-ui-lean":
-        runRebuildUi({ features: ["lean"] });
         break;
       case "open-cursor":
         openInCursor();
@@ -3897,17 +4518,6 @@
           if (cosmosOk) runCmd("new-folder");
           return;
         }
-        if (mod && e.shiftKey && !e.altKey && e.code === "Digit2") {
-          eatKey(e);
-          if (cosmosOk) runCmd("mode-2d");
-          return;
-        }
-        if (mod && e.shiftKey && !e.altKey && e.code === "Digit3") {
-          eatKey(e);
-          if (cosmosOk) runCmd("mode-3d");
-          return;
-        }
-
         if (inRename) return;
         if (overlayOpen) return;
         if (inField && e.key !== "Escape") {
@@ -3991,7 +4601,7 @@
             return;
           }
           eatKey(e);
-          if (star) startRename(v, star);
+          if (star) startRename(v, star, { fromKey: true });
         } else if (e.key === "Delete") {
           if (sel.length) deleteStars(v, sel);
           else if (star) deleteStars(v, [star]);
@@ -4066,6 +4676,7 @@
     refreshViewMenu();
     refreshModeButton();
     applyShellClass();
+    if (next === "windows") undockAllOsDocks();
   }
 
   async function refreshHealth() {
@@ -4100,20 +4711,29 @@
         next === "stardust"
           ? { mode: "stardust", replace: true, hideDesktopIcons: true }
           : { mode: "windows", replace: false, hideDesktopIcons: false };
-      const data = await apiJSON("POST", "/api/ui-mode", body, 12000);
+      const data = await apiJSON("POST", "/api/ui-mode", body, 12000, { keepalive: true });
       state.uiMode = (data && data.mode) || next;
       state.meta.replaceArmed = !!(data && data.replaceArmed);
       state.meta.hideDesktopIcons = !!(data && data.hideDesktopIcons);
       try {
         const meta = await api.get("/api/meta");
         Object.assign(state.meta, meta || {});
-        state.uiMode = state.meta.uiMode === "stardust" ? "stardust" : "windows";
+        state.meta.replaceArmed = !!(data && data.replaceArmed);
+        state.meta.hideDesktopIcons = !!(data && data.hideDesktopIcons);
+        state.uiMode = next;
       } catch (_) {}
       if (data && data.warning) toast("StarDust UI without Explorer hook: " + data.warning);
       else if (next === "windows") toast("Windows Explorer restored — desktop icons and folder opens.");
       else toast("StarDust UI on — desktop icons hidden. Failsafe Ctrl+Shift+F12.");
       refreshViewMenu();
       paintStatus();
+      if (next === "windows") {
+        undockAllOsDocks();
+        state.views.forEach((v) => {
+          if (v.cns) return;
+          loadChildren(v);
+        });
+      }
       const v = focusedView();
       if (next === "stardust" && v && !v.cns && state.meta.desktopPath) {
         navigateView(v, state.meta.desktopPath, true);
@@ -4121,12 +4741,30 @@
       applyShellClass();
       if (next === "stardust") schedulePeekSlot();
     } catch (e) {
-      state.uiMode = prev;
-      refreshViewMenu();
-      paintStatus();
-      applyShellClass();
-      const msg = errText(e);
-      toast(/timed out/i.test(msg) ? "Switch timed out — try again." : msg);
+      let recovered = false;
+      try {
+        const meta = await api.get("/api/meta");
+        Object.assign(state.meta, meta || {});
+        const actual = state.meta.uiMode === "stardust" ? "stardust" : "windows";
+        if (actual === next) {
+          state.uiMode = actual;
+          recovered = true;
+        }
+      } catch (_) {}
+      if (recovered) {
+        refreshViewMenu();
+        paintStatus();
+        applyShellClass();
+        if (next === "windows") toast("Windows Explorer restored — desktop icons and folder opens.");
+        else toast("StarDust UI on — desktop icons hidden. Failsafe Ctrl+Shift+F12.");
+      } else {
+        state.uiMode = prev;
+        refreshViewMenu();
+        paintStatus();
+        applyShellClass();
+        const msg = errText(e);
+        toast(/timed out/i.test(msg) ? "Switch timed out — try again." : msg);
+      }
     } finally {
       uiModeBusy = false;
     }
@@ -4174,13 +4812,17 @@
     state.agentOpen = saved.agentOpen !== false;
     state.agentWidth = saved.agentWidth || 380;
     state.agentModel = saved.agentModel || saved.model || "composer-2.5";
-    state.sortMode = saved.sortMode || "galaxy";
+    state.layoutMode = migrateLayoutMode(saved);
     state.starPos = normalizeStarPos(
       saved.starPos || {
         "2d": saved.positions2d || {},
         "3d": saved.positions3d || {},
       }
     );
+    if (saved.gridPack !== 2) {
+      state.starPos["2dGrid"] = {};
+      state.starPos["3dGrid"] = {};
+    }
     state.starLooks = saved.starLooks || {};
     state.pins = saved.pins || [];
     const seenPin = new Set();
@@ -4233,15 +4875,27 @@
     if (openQ && !deskQ) {
       const v = makeView(openQ, openQ);
       state.split = { type: "leaf", viewId: v.id };
+    } else if (deskQ) {
+      const p = state.meta.desktopPath || sessionRoot() || root;
+      const v = makeView(p, p);
+      state.split = { type: "leaf", viewId: v.id };
     } else if (saved.views && saved.views.length) {
       saved.views.forEach((sv) => {
+        if (sv.windowDock) return;
         const v = makeView(sv.root || root, sv.path || sv.root || root, sv.camera);
         v.id = sv.id || v.id;
         v.minimized = !!sv.minimized;
-        v.windowDock = !!sv.windowDock;
         v.mode = sv.mode === "3d" || (!sv.mode && saved.mode === "3d") ? "3d" : "2d";
       });
-      state.split = saved.split || { type: "leaf", viewId: state.views[0].id };
+      if (!state.views.length) {
+        const v = makeView(root, root);
+        state.split = { type: "leaf", viewId: v.id };
+      } else {
+        state.split = pruneMissingViews(saved.split) || {
+          type: "leaf",
+          viewId: state.views[0].id,
+        };
+      }
       state.views.forEach((v) => {
         const n = parseInt(String(v.id).replace(/\D/g, ""), 10);
         if (Number.isFinite(n) && n >= state.vid) state.vid = n + 1;
@@ -4284,6 +4938,8 @@
     }, 1000);
     setInterval(refreshHealth, 2000);
     setInterval(pollUiInbox, 200);
+    scheduleUserDockPoll();
+    schedulePeekSlot();
     if (saved.floats && saved.floats.length) {
       SD.editor.restore(saved.floats).catch(() => {});
     }

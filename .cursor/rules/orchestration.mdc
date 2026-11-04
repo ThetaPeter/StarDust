@@ -58,7 +58,7 @@ Required for the overall goal, every orchestrator planning step, and every subag
 - **Output**: Changed files, commands run, metrics, pass/fail, blockers.
 - **Benchmark**: The test or check that must pass.
 
-**Locked authority for this repo:** dumpable IR is the source of truth; `.sd` is a copy. Current-wave I/O/B lives in `waves.md`. Done-layer detail lives in `waves-done.md`. Kernel ioctl ABI lives in `kmod/stardust/stardust_uapi.h` and `kmod/stardust-kmdf/stardust_uapi.h`. Do not dispatch “fix the IR to match a syntax convenience.”
+**Locked authority for this repo:** dumpable IR is the source of truth; `.sd` is a copy. Current-wave I/O/B lives in `stardust/waves.md`. Done-layer detail lives in the `stardust/waves.md` Archive. Kernel ioctl ABI lives in `stardust/kmod/stardust/stardust_uapi.h` and `stardust/kmod/stardust-kmdf/stardust_uapi.h`. Do not dispatch “fix the IR to match a syntax convenience.”
 
 ## Escalation criteria
 
@@ -79,6 +79,6 @@ Do **not** escalate only for clearly mechanical work with a fixed I/O/B and no o
 
 ## Verification gates (put these in every contract)
 
-- **Zero-regression gate:** compare **matched sets**, not just counts — a +N/−N swap can hide regressions behind a stable total. Name the exact baseline in the contract (e.g. L1 `round_trip_ir`, `store_retrieve`, `view_identity`, `alignment` from `waves.md` Named tests).
+- **Zero-regression gate:** compare **matched sets**, not just counts — a +N/−N swap can hide regressions behind a stable total. Name the exact baseline in the contract (e.g. L1 `round_trip_ir`, `store_retrieve`, `view_identity`, `alignment` from `stardust/waves.md` Named tests).
 - **No expectation edits:** smoke/test expected values may not be changed by a subagent. If the derivation is right and the *expectation* is stale, escalate — the Developer approves expectation updates.
-- **Locked-authority rule:** state which artifact is the source of truth for the task (`waves.md` for the current O-wave; `waves-done.md` for a done layer; dumpable IR over `.sd`; UAPI headers for ioctl) so a divergence is resolved toward the authority instead of being "fixed" in the wrong direction.
+- **Locked-authority rule:** state which artifact is the source of truth for the task (`stardust/waves.md` for the current O-wave; `stardust/waves.md` Archive for a done layer; dumpable IR over `.sd`; UAPI headers for ioctl) so a divergence is resolved toward the authority instead of being "fixed" in the wrong direction.

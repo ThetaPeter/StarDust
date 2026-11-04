@@ -191,7 +191,7 @@
           } else {
             warn.innerHTML =
               "Set <code>CURSOR_API_KEY</code> in the environment or a gitignored local env file " +
-              "(<code>crates/fs-viz/.env</code>). The cosmos UI still works without the agent sidecar.";
+              "(<code>stardust-ui/.env</code>). The cosmos UI still works without the agent sidecar.";
           }
         } else {
           warn.hidden = true;

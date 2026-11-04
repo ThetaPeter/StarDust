@@ -1,0 +1,9 @@
+[package]
+name = "stardust-packet"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Packet workshop C and Rust shared-library fixtures"
+
+[build-dependencies]
+cc = "1"

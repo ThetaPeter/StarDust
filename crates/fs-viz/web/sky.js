@@ -314,7 +314,12 @@
     rebuildBakes();
     window.addEventListener("resize", fit);
 
+    window.SDSky = { frozen: false };
     function draw(now) {
+      if (window.SDSky && window.SDSky.frozen) {
+        requestAnimationFrame(draw);
+        return;
+      }
       const w = cssW;
       const h = cssH;
       const t = now / 1000;
@@ -367,7 +372,7 @@
       requestAnimationFrame(draw);
     }
     requestAnimationFrame(draw);
-    window.SDSky = {};
+    window.SDSky = window.SDSky || { frozen: false };
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();

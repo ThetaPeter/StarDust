@@ -136,64 +136,114 @@
   }
 
   function starSep(kind) {
-    return kind === "dir" ? 18 : 8;
+    return kind === "dir" ? 60 : 30;
   }
 
-  function placeUnoccupied(missing, saved) {
-    const occ = [];
+  const GRID_W = 96;
+  const GRID_H = 84;
+
+  function fitEndName(ctx, name, maxW) {
+    const s = String(name || "");
+    if (!s || ctx.measureText(s).width <= maxW) return s;
+    const ell = "…";
+    if (ctx.measureText(ell).width >= maxW) return ell;
+    let lo = 0;
+    let hi = s.length;
+    while (lo < hi) {
+      const mid = ((lo + hi + 1) / 2) | 0;
+      if (ctx.measureText(s.slice(0, mid) + ell).width <= maxW) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo > 0 ? s.slice(0, lo) + ell : ell;
+  }
+
+  function gridCell(x, y) {
+    return { c: Math.round(x / GRID_W), r: Math.round(y / GRID_H) };
+  }
+
+  function gridXy(c, r) {
+    return { x: c * GRID_W, y: r * GRID_H };
+  }
+
+  function occupyKey(c, r) {
+    return c + ":" + r;
+  }
+
+  function emptyGridCell(x, y, blockers) {
+    const taken = {};
+    (blockers || []).forEach((o) => {
+      const g = gridCell(o.x, o.y);
+      taken[occupyKey(g.c, g.r)] = 1;
+    });
+    const gc = gridCell(x, y);
+    const band = 24;
+    for (let i = 0; i < 2048; i++) {
+      const c = gc.c + (i % band);
+      const r = gc.r + ((i / band) | 0);
+      if (!taken[occupyKey(c, r)]) return gridXy(c, r);
+    }
+    return gridXy(gc.c + 1, gc.r);
+  }
+
+  function packGrid(children, origin, viewW, viewH, scale) {
+    const items = (children || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    const n = items.length;
+    const pos = {};
+    if (!n) return pos;
+    const ox = origin && origin.x != null ? origin.x : 0;
+    const oy = origin && origin.y != null ? origin.y : 0;
+    const sc = Math.max(0.18, scale || 1);
+    const worldW = (viewW || 480) / sc;
+    const worldH = (viewH || 320) / sc;
+    const maxCols = Math.max(1, Math.floor((worldW * 0.84) / GRID_W));
+    const maxRows = Math.max(1, Math.floor((worldH * 0.84) / GRID_H));
+    let cols = Math.max(1, Math.round(Math.sqrt(n)));
+    cols = Math.min(n, cols, maxCols);
+    let rows = Math.ceil(n / cols);
+    if (rows > maxRows) {
+      cols = Math.min(n, maxCols, Math.max(1, Math.ceil(n / maxRows)));
+      rows = Math.ceil(n / cols);
+    }
+    const x0 = Math.round((ox - ((cols - 1) * GRID_W) / 2) / GRID_W) * GRID_W;
+    const y0 = Math.round((oy - ((rows - 1) * GRID_H) / 2) / GRID_H) * GRID_H;
+    items.forEach((s, i) => {
+      pos[s.name] = { x: x0 + (i % cols) * GRID_W, y: y0 + Math.floor(i / cols) * GRID_H };
+    });
+    return pos;
+  }
+
+  function placeUnoccupiedGrid(missing, saved, origin) {
+    const blockers = [];
     Object.keys(saved || {}).forEach((k) => {
       const p = saved[k];
       if (!p) return;
-      occ.push({ x: p.x, y: p.y, sep: starSep(p.kind) });
+      blockers.push({ x: p.x, y: p.y });
     });
-    let rMax = 0;
-    for (let i = 0; i < occ.length; i++) {
-      const d = Math.hypot(occ[i].x, occ[i].y);
-      if (d > rMax) rMax = d;
-    }
-    const r0 = rMax + 48;
-    const bodies = (missing || []).map((s, i) => {
-      const a = i * GOLDEN;
-      const r = r0 + 26 * Math.sqrt(i + 1);
-      return {
-        name: s.name,
-        sep: starSep(s.kind),
-        x: Math.cos(a) * r,
-        y: Math.sin(a) * r,
-      };
-    });
-    for (let k = 0; k < 24; k++) {
-      for (let i = 0; i < bodies.length; i++) {
-        let fx = 0;
-        let fy = 0;
-        const acc = (ox, oy, osep) => {
-          const dx = bodies[i].x - ox;
-          const dy = bodies[i].y - oy;
-          const need = bodies[i].sep + osep;
-          const d = Math.hypot(dx, dy);
-          if (d < 0.0001) {
-            const a = (i + 1) * GOLDEN;
-            fx += Math.cos(a) * need;
-            fy += Math.sin(a) * need;
-            return;
-          }
-          if (d < need) {
-            const m = (need - d) / d;
-            fx += dx * m;
-            fy += dy * m;
-          }
-        };
-        for (let j = 0; j < occ.length; j++) acc(occ[j].x, occ[j].y, occ[j].sep);
-        for (let j = 0; j < bodies.length; j++) {
-          if (i !== j) acc(bodies[j].x, bodies[j].y, bodies[j].sep);
-        }
-        bodies[i].x += fx * 0.4;
-        bodies[i].y += fy * 0.4;
-      }
-    }
+    const ox = origin && origin.x != null ? origin.x : 0;
+    const oy = origin && origin.y != null ? origin.y : 0;
     const pos = {};
-    bodies.forEach((b) => {
-      pos[b.name] = { x: b.x, y: b.y };
+    (missing || []).forEach((s) => {
+      const p = emptyGridCell(ox, oy, blockers);
+      pos[s.name] = { x: p.x, y: p.y };
+      blockers.push({ x: p.x, y: p.y });
+    });
+    return pos;
+  }
+
+  function placeUnoccupied(missing, saved, origin) {
+    const blockers = [];
+    Object.keys(saved || {}).forEach((k) => {
+      const p = saved[k];
+      if (!p) return;
+      blockers.push({ x: p.x, y: p.y, kind: p.kind || "file" });
+    });
+    const ox = origin && origin.x != null ? origin.x : 0;
+    const oy = origin && origin.y != null ? origin.y : 0;
+    const pos = {};
+    (missing || []).forEach((s) => {
+      const p = spiralAway(ox, oy, blockers, s.kind);
+      pos[s.name] = { x: p.x, y: p.y };
+      blockers.push({ x: p.x, y: p.y, kind: s.kind || "file" });
     });
     return pos;
   }
@@ -211,25 +261,227 @@
     return list;
   }
 
+  function clusterStats(blockers) {
+    if (!blockers || !blockers.length) return null;
+    let sx = 0;
+    let sy = 0;
+    let minx = Infinity;
+    let maxx = -Infinity;
+    let miny = Infinity;
+    let maxy = -Infinity;
+    blockers.forEach((o) => {
+      sx += o.x;
+      sy += o.y;
+      if (o.x < minx) minx = o.x;
+      if (o.x > maxx) maxx = o.x;
+      if (o.y < miny) miny = o.y;
+      if (o.y > maxy) maxy = o.y;
+    });
+    const n = blockers.length;
+    const cx = sx / n;
+    const cy = sy / n;
+    let r = 0;
+    blockers.forEach((o) => {
+      const d = Math.hypot(o.x - cx, o.y - cy);
+      if (d > r) r = d;
+    });
+    return { cx, cy, r, minx, maxx, miny, maxy };
+  }
+
+  function convexHull(pts) {
+    if (!pts || pts.length < 3) return null;
+    const raw = pts
+      .map((o) => ({ x: o.x, y: o.y }))
+      .sort((a, b) => a.x - b.x || a.y - b.y);
+    const uniq = [];
+    raw.forEach((q) => {
+      const last = uniq[uniq.length - 1];
+      if (!last || last.x !== q.x || last.y !== q.y) uniq.push(q);
+    });
+    if (uniq.length < 3) return null;
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const lower = [];
+    uniq.forEach((q) => {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0)
+        lower.pop();
+      lower.push(q);
+    });
+    const upper = [];
+    for (let i = uniq.length - 1; i >= 0; i--) {
+      const q = uniq[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0)
+        upper.pop();
+      upper.push(q);
+    }
+    lower.pop();
+    upper.pop();
+    return lower.concat(upper);
+  }
+
+  function pointInHull(hull, x, y) {
+    if (!hull || hull.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = hull.length - 1; i < hull.length; j = i++) {
+      const xi = hull[i].x;
+      const yi = hull[i].y;
+      const xj = hull[j].x;
+      const yj = hull[j].y;
+      const denom = yj - yi || 1e-12;
+      const hit = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / denom + xi;
+      if (hit) inside = !inside;
+    }
+    return inside;
+  }
+
+  function distPointSeg(px, py, ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-8) return Math.hypot(px - ax, py - ay);
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+  }
+
+  function knnPairs(blockers, k) {
+    const n = blockers.length;
+    const seen = {};
+    const pairs = [];
+    for (let i = 0; i < n; i++) {
+      const ds = [];
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        ds.push({ j, d: Math.hypot(blockers[i].x - blockers[j].x, blockers[i].y - blockers[j].y) });
+      }
+      ds.sort((a, b) => a.d - b.d);
+      const take = Math.min(k, ds.length);
+      for (let t = 0; t < take; t++) {
+        const j = ds[t].j;
+        const a = i < j ? i : j;
+        const b = i < j ? j : i;
+        const key = a + ":" + b;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        pairs.push([a, b, ds[t].d]);
+      }
+    }
+    return pairs;
+  }
+
+  function pickRand(list) {
+    if (!list || !list.length) return null;
+    return list[(Math.random() * list.length) | 0];
+  }
+
+  function samePt(a, b) {
+    return Math.abs(a.x - b.x) < 0.01 && Math.abs(a.y - b.y) < 0.01;
+  }
+
+  function isHullEdge(hull, a, b) {
+    if (!hull || hull.length < 2) return false;
+    for (let i = 0, j = hull.length - 1; i < hull.length; j = i++) {
+      const p = hull[j];
+      const q = hull[i];
+      if ((samePt(p, a) && samePt(q, b)) || (samePt(p, b) && samePt(q, a))) return true;
+    }
+    return false;
+  }
+
   function spiralAway(x, y, blockers, kind) {
     const selfSep = starSep(kind || "dir");
+    const needOf = (o) => selfSep + starSep(o.kind);
     const blocked = (px, py) => {
       for (let i = 0; i < blockers.length; i++) {
-        const o = blockers[i];
-        const need = selfSep + starSep(o.kind);
-        if (Math.hypot(px - o.x, py - o.y) < need) return true;
+        if (Math.hypot(px - blockers[i].x, py - blockers[i].y) < needOf(blockers[i])) return true;
       }
       return false;
     };
-    if (!blocked(x, y)) return { x, y };
-    for (let i = 1; i < 96; i++) {
-      const a = i * GOLDEN;
-      const r = selfSep * 2 + 12 * Math.sqrt(i);
-      const px = x + Math.cos(a) * r;
-      const py = y + Math.sin(a) * r;
-      if (!blocked(px, py)) return { x: px, y: py };
+    if (!blockers || !blockers.length) return { x, y };
+    const box = clusterStats(blockers);
+    const hull = convexHull(blockers);
+    const inGap = (px, py) => {
+      if (blocked(px, py)) return false;
+      if (hull && !pointInHull(hull, px, py)) return false;
+      return true;
+    };
+    const pad = selfSep * 1.15;
+    const corridors = [];
+    const pairs = knnPairs(blockers, 6);
+    for (let p = 0; p < pairs.length; p++) {
+      const a = blockers[pairs[p][0]];
+      const b = blockers[pairs[p][1]];
+      const d = pairs[p][2];
+      if (d < selfSep * 2) continue;
+      if (isHullEdge(hull, a, b)) continue;
+      let clear = true;
+      for (let i = 0; i < blockers.length; i++) {
+        if (blockers[i] === a || blockers[i] === b) continue;
+        if (distPointSeg(blockers[i].x, blockers[i].y, a.x, a.y, b.x, b.y) < pad) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      const ux = (b.x - a.x) / d;
+      const uy = (b.y - a.y) / d;
+      const rx = -uy;
+      const ry = ux;
+      const spots = [];
+      const steps = Math.max(4, Math.min(9, Math.round(d / (selfSep * 1.4))));
+      for (let s = 1; s < steps; s++) {
+        const t = s / steps;
+        if (t < 0.22 || t > 0.78) continue;
+        const px = a.x + ux * d * t;
+        const py = a.y + uy * d * t;
+        if (inGap(px, py)) spots.push({ x: px, y: py });
+      }
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+      const off = selfSep * 0.8;
+      const p1 = { x: midX + rx * off, y: midY + ry * off };
+      const p2 = { x: midX - rx * off, y: midY - ry * off };
+      if (inGap(p1.x, p1.y)) spots.push(p1);
+      if (inGap(p2.x, p2.y)) spots.push(p2);
+      if (spots.length) corridors.push({ d, spots });
     }
-    return { x: x + selfSep * 2, y };
+    if (corridors.length) {
+      let maxD = 0;
+      for (let i = 0; i < corridors.length; i++) {
+        if (corridors[i].d > maxD) maxD = corridors[i].d;
+      }
+      const large = corridors.filter((c) => c.d >= maxD * 0.72);
+      const chosen = pickRand(large);
+      const spot = pickRand(chosen.spots);
+      if (spot) return spot;
+    }
+
+    const N = 16;
+    const rim = [];
+    for (let i = 0; i < N; i++) {
+      const a = (i * Math.PI * 2) / N;
+      const ux = Math.cos(a);
+      const uy = Math.sin(a);
+      let support = selfSep;
+      for (let b = 0; b < blockers.length; b++) {
+        const o = blockers[b];
+        const s = (o.x - box.cx) * ux + (o.y - box.cy) * uy + needOf(o);
+        if (s > support) support = s;
+      }
+      for (let t = 0; t < 12; t++) {
+        const rr = support + t * (selfSep * 0.18);
+        const px = box.cx + ux * rr;
+        const py = box.cy + uy * rr;
+        if (!blocked(px, py)) {
+          rim.push({ x: px, y: py });
+          break;
+        }
+      }
+    }
+    const edge = pickRand(rim);
+    if (edge) return edge;
+    if (!blocked(x, y)) return { x, y };
+    return { x: box.cx + box.r + selfSep * 2, y: box.cy };
   }
 
   function cloneMap(m) {
@@ -239,6 +491,14 @@
       if (p) o[k] = { x: p.x, y: p.y };
     });
     return o;
+  }
+
+  function livePosMap(map, names) {
+    const out = {};
+    Object.keys(map || {}).forEach((k) => {
+      if (names.has(k) && map[k]) out[k] = map[k];
+    });
+    return out;
   }
 
   function captureCanvasDataUrl(src, type, quality, maxEdge) {
@@ -287,6 +547,7 @@
         dirPath: "",
         frozen: {},
         arranged: false,
+        layoutMode: "galaxy",
         sel: new Set(),
         searchSel: new Set(),
         anchor: null,
@@ -325,7 +586,10 @@
       }
       function glyphOf(star) {
         const looks = self.looks || {};
-        return looks[lookKey(star.path)] || looks[star.path] || null;
+        const look = looks[lookKey(star.path)] || looks[star.path] || null;
+        if (look && look.image) return look;
+        if (star && star.logo) return { image: star.logo };
+        return look;
       }
       function stampGlyphs() {
         self.stars.forEach((s) => {
@@ -451,12 +715,17 @@
         setStatus();
         if (self.loading) return;
         self.hostLayout = !!opts.hostLayout;
+        self.layoutMode = opts.layoutMode === "grid" ? "grid" : "galaxy";
         self.dirPath = opts.dirPath || "";
+        if (opts.resetCamera) self.cam = { x: 0, y: 0, scale: 1 };
+        else if (opts.camera) self.cam = Object.assign({}, self.cam, opts.camera);
+        fit();
         const children = (opts.children || []).map((c) => Object.assign({}, c));
         const saved = cloneMap(opts.savedPositions || {});
         const missing = children.filter((c) => !saved[c.name]);
         let map = saved;
         let changed = false;
+        const origin = { x: self.cam.x, y: self.cam.y };
         if (opts.hostLayout) {
           map = {};
           children.forEach((c) => {
@@ -464,7 +733,10 @@
           });
           changed = false;
         } else if (!Object.keys(saved).length && children.length) {
-          map = layoutGalaxy(children);
+          map =
+            self.layoutMode === "grid"
+              ? packGrid(children, origin, self.w, self.h, self.cam.scale)
+              : layoutGalaxy(children);
           changed = true;
         } else if (missing.length) {
           const occ = cloneMap(saved);
@@ -478,19 +750,36 @@
             if (p) occ[c.name] = { x: p.x, y: p.y, kind: c.kind };
             else rest.push(c);
           });
-          map = Object.assign({}, saved, rest.length ? placeUnoccupied(rest, occ) : {});
+          const placed =
+            rest.length === 0
+              ? {}
+              : self.layoutMode === "grid"
+                ? placeUnoccupiedGrid(rest, occ, origin)
+                : placeUnoccupied(rest, occ, origin);
+          map = Object.assign({}, saved, placed);
           changed = true;
         }
+        const pend = self.pending || {};
+        const names = new Set(children.map((c) => c.name));
         if (!opts.hostLayout) {
-          const pend = self.pending || {};
-          const names = new Set(children.map((c) => c.name));
           Object.keys(pend).forEach((name) => {
-            if (!names.has(name)) return;
+            if (!names.has(name) || saved[name]) return;
             map[name] = { x: pend[name].x, y: pend[name].y };
             changed = true;
           });
         }
-        self.pending = {};
+        if (!opts.hostLayout && !opts.error) {
+          const live = livePosMap(map, names);
+          if (Object.keys(map).some((k) => !names.has(k))) {
+            map = live;
+            changed = true;
+          }
+        }
+        const kept = {};
+        Object.keys(pend).forEach((name) => {
+          if (!names.has(name)) kept[name] = pend[name];
+        });
+        self.pending = kept;
         self.frozen = cloneMap(map);
         self.arranged = false;
         const Look = window.SDLook;
@@ -515,8 +804,6 @@
         self.anchor = null;
         self.hover = null;
         if (changed && !opts.ephemeral) emitPos();
-        if (opts.resetCamera) self.cam = { x: 0, y: 0, scale: 1 };
-        else if (opts.camera) self.cam = Object.assign({}, self.cam, opts.camera);
       }
 
       function arrangeBy(key) {
@@ -608,7 +895,10 @@
         }
         const cnsLabelsOpen = !self.hostLayout || cnsVis <= 35 || self.cam.scale * 5 >= 36;
         for (const s of self.stars) {
-          if (self.drag && self.drag.kind === "star" && self.drag.moved && self.drag.star === s) continue;
+          if (self.drag && self.drag.kind === "star" && self.drag.moved && self.drag.ghost) {
+            const g = self.drag.group;
+            if (self.drag.star === s || (g && g.some((x) => x.star === s))) continue;
+          }
           const p = toScreen(s);
           if (p.x < -50 || p.y < -50 || p.x > w + 50 || p.y > hgt + 50) continue;
           const r = starR(s);
@@ -701,8 +991,11 @@
           ctx.textBaseline = "top";
           ctx.shadowColor = word ? "rgba(0,0,0,0.7)" : "rgba(0,0,0,0.92)";
           ctx.shadowBlur = word ? 3 : 7;
+          const showFull = on || (self.hover === s);
+          const maxW = Math.max(36, Math.min(220, GRID_W * Math.max(0.45, self.cam.scale || 1)));
+          const label = word || showFull ? s.name : fitEndName(ctx, s.name, maxW);
           if (picked) {
-            const tw = ctx.measureText(s.name).width;
+            const tw = ctx.measureText(label).width;
             const bx = p.x - tw / 2 - 5;
             const by = p.y + r + 5;
             ctx.shadowBlur = 0;
@@ -720,14 +1013,14 @@
             }
             ctx.fillStyle = "rgba(255, 244, 220, 0.98)";
           }
-          ctx.fillText(s.name, p.x, p.y + r + 7);
+          ctx.fillText(label, p.x, p.y + r + 7);
           ctx.globalAlpha = 1;
           ctx.shadowBlur = 0;
           if (ctx.letterSpacing !== undefined) ctx.letterSpacing = "0px";
           ctx.globalCompositeOperation = "lighter";
         }
         ctx.globalCompositeOperation = "source-over";
-        kickDraw();
+        if (self.live && !(window.SD && window.SD.motionFrozen)) kickDraw();
       }
 
       let drawRaf = 0;
@@ -808,6 +1101,14 @@
       let firstEnter = true;
       function isNav(e) {
         return e.ctrlKey || e.metaKey;
+      }
+      function grabGroup(star) {
+        if (!star) return [];
+        const names = self.sel.has(star.name) ? [...self.sel] : [star.name];
+        return names
+          .map((n) => self.stars.find((x) => x.name === n))
+          .filter(Boolean)
+          .map((st) => ({ star: st, x: st.x, y: st.y }));
       }
       function zoomCamera(e) {
         const world = toWorld(e.clientX, e.clientY);
@@ -972,6 +1273,7 @@
           py: e.clientY,
           grabX: s ? s.x : 0,
           grabY: s ? s.y : 0,
+          group: s ? grabGroup(s) : [],
           lastClient: { x: e.clientX, y: e.clientY },
           ghost: null,
           moved: false,
@@ -1033,18 +1335,58 @@
         if (window.SDStarDrag) window.SDStarDrag.hide();
       }
 
+      function snapMovedToGrid(d) {
+        const moved = (d.group && d.group.length ? d.group : [{ star: d.star }])
+          .map((g) => g && g.star)
+          .filter(Boolean);
+        if (!moved.length) return;
+        const taken = {};
+        self.stars.forEach((s) => {
+          if (moved.indexOf(s) >= 0) return;
+          const g = gridCell(s.x, s.y);
+          taken[occupyKey(g.c, g.r)] = 1;
+        });
+        function blockersOf() {
+          return Object.keys(taken).map((k) => {
+            const parts = k.split(":");
+            return gridXy(+parts[0], +parts[1]);
+          });
+        }
+        const leader = d.star || moved[0];
+        const from = gridCell(leader.x, leader.y);
+        const lp = emptyGridCell(leader.x, leader.y, blockersOf());
+        const to = gridCell(lp.x, lp.y);
+        const dc = to.c - from.c;
+        const dr = to.r - from.r;
+        moved.forEach((st) => {
+          const g = gridCell(st.x, st.y);
+          const p = emptyGridCell((g.c + dc) * GRID_W, (g.r + dr) * GRID_H, blockersOf());
+          st.x = p.x;
+          st.y = p.y;
+          taken[occupyKey(gridCell(p.x, p.y).c, gridCell(p.x, p.y).r)] = 1;
+          self.frozen[st.name] = { x: st.x, y: st.y };
+        });
+      }
+
       function moveStarFromGrab(e) {
         const d = self.drag;
         if (!d || d.kind !== "star" || !d.star) return;
         d.lastClient = { x: e.clientX, y: e.clientY };
         if (Math.hypot(e.clientX - d.px, e.clientY - d.py) > 3) d.moved = true;
+        if (!d.moved) return;
         if (pointerInContainer(e.clientX, e.clientY)) {
-          const st = d.star;
-          st.x = d.grabX + (e.clientX - d.px) / self.cam.scale;
-          st.y = d.grabY + (e.clientY - d.py) / self.cam.scale;
-          if (!self.arranged) self.frozen[st.name] = { x: st.x, y: st.y };
-        }
-        if (d.moved && window.SDStarDrag) {
+          const dx = (e.clientX - d.px) / self.cam.scale;
+          const dy = (e.clientY - d.py) / self.cam.scale;
+          const members = d.group && d.group.length ? d.group : [{ star: d.star, x: d.grabX, y: d.grabY }];
+          members.forEach((g) => {
+            const st = g.star;
+            if (!st) return;
+            st.x = g.x + dx;
+            st.y = g.y + dy;
+            self.frozen[st.name] = { x: st.x, y: st.y };
+          });
+          hideStarGhost();
+        } else if (window.SDStarDrag) {
           if (!d.ghost) d.ghost = window.SDStarDrag.capture(d.star, starR(d.star));
           window.SDStarDrag.show(d.ghost, e.clientX, e.clientY);
         }
@@ -1073,7 +1415,11 @@
         }
         if (d.kind === "star" && d.moved) {
           const fileMove = h.onStarDragEnd ? h.onStarDragEnd(d.star, ev) : false;
-          if (!self.arranged && !fileMove) emitPos();
+          if (!fileMove) {
+            if (self.layoutMode === "grid") snapMovedToGrid(d);
+            emitPos();
+            kickDraw();
+          }
           return;
         }
         if (d.kind === "pan") return;
@@ -1260,7 +1606,11 @@
         },
         notePending(name, x, y, kind) {
           if (!self.pending) self.pending = {};
-          const p = spiralAway(x, y, hintBlockers(self.stars, self.pending, name), kind);
+          const blockers = hintBlockers(self.stars, self.pending, name);
+          const p =
+            self.layoutMode === "grid"
+              ? emptyGridCell(x, y, blockers)
+              : spiralAway(x, y, blockers, kind);
           self.pending[name] = { x: p.x, y: p.y, kind: kind || "file" };
         },
         placeHint() {

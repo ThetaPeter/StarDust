@@ -57,65 +57,100 @@
   }
 
   function starSep(kind) {
-    return kind === "dir" ? 40 : 20;
+    return kind === "dir" ? 78 : 39;
   }
 
-  function placeUnoccupied(missing, saved) {
-    const occ = [];
+  const GRID_W = 56;
+  const GRID_H = 48;
+
+  function gridCell(x, y) {
+    return { c: Math.round(x / GRID_W), r: Math.round(y / GRID_H) };
+  }
+
+  function gridXy(c, r) {
+    return { x: c * GRID_W, y: r * GRID_H };
+  }
+
+  function occupyKey(c, r) {
+    return c + ":" + r;
+  }
+
+  function emptyGridCell(x, y, blockers) {
+    const taken = {};
+    (blockers || []).forEach((o) => {
+      const g = gridCell(o.x, o.y);
+      taken[occupyKey(g.c, g.r)] = 1;
+    });
+    const gc = gridCell(x, y);
+    const band = 24;
+    for (let i = 0; i < 2048; i++) {
+      const c = gc.c + (i % band);
+      const r = gc.r + Math.floor(i / band);
+      if (!taken[occupyKey(c, r)]) return gridXy(c, r);
+    }
+    return gridXy(gc.c + 1, gc.r);
+  }
+
+  function packGrid(children, origin, worldW, worldH) {
+    const items = (children || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    const n = items.length;
+    const pos = {};
+    if (!n) return pos;
+    const ox = origin && origin.x != null ? origin.x : 0;
+    const oy = origin && origin.y != null ? origin.y : 0;
+    const maxCols = Math.max(1, Math.floor(((worldW || 480) * 0.84) / GRID_W));
+    const maxRows = Math.max(1, Math.floor(((worldH || 320) * 0.84) / GRID_H));
+    let cols = Math.max(1, Math.round(Math.sqrt(n)));
+    cols = Math.min(n, cols, maxCols);
+    let rows = Math.ceil(n / cols);
+    if (rows > maxRows) {
+      cols = Math.min(n, maxCols, Math.max(1, Math.ceil(n / maxRows)));
+      rows = Math.ceil(n / cols);
+    }
+    const x0 = Math.round((ox - ((cols - 1) * GRID_W) / 2) / GRID_W) * GRID_W;
+    const y0 = Math.round((oy - ((rows - 1) * GRID_H) / 2) / GRID_H) * GRID_H;
+    items.forEach((s, i) => {
+      pos[s.name] = {
+        x: x0 + (i % cols) * GRID_W,
+        y: y0 + Math.floor(i / cols) * GRID_H,
+        z: s.kind === "dir" ? 12 : 0,
+      };
+    });
+    return pos;
+  }
+
+  function placeUnoccupiedGrid(missing, saved, origin) {
+    const blockers = [];
     Object.keys(saved || {}).forEach((k) => {
       const p = saved[k];
       if (!p) return;
-      occ.push({ x: p.x, y: p.y, z: p.z || 0, sep: starSep(p.kind) });
+      blockers.push({ x: p.x, y: p.y });
     });
-    let rMax = 0;
-    for (let i = 0; i < occ.length; i++) {
-      const d = Math.hypot(occ[i].x, occ[i].y);
-      if (d > rMax) rMax = d;
-    }
-    const r0 = rMax + 48;
-    const bodies = (missing || []).map((s, i) => {
-      const a = i * GOLDEN;
-      const r = r0 + 26 * Math.sqrt(i + 1);
-      return {
-        name: s.name,
-        sep: starSep(s.kind),
-        x: Math.cos(a) * r,
-        y: Math.sin(a) * r * 0.85,
-        z: (s.kind === "dir" ? 12 : 0) + 8 * Math.sin((i + 1) * GOLDEN),
-      };
-    });
-    for (let k = 0; k < 24; k++) {
-      for (let i = 0; i < bodies.length; i++) {
-        let fx = 0;
-        let fy = 0;
-        const acc = (ox, oy, osep) => {
-          const dx = bodies[i].x - ox;
-          const dy = bodies[i].y - oy;
-          const need = bodies[i].sep + osep;
-          const d = Math.hypot(dx, dy);
-          if (d < 0.0001) {
-            const a = (i + 1) * GOLDEN;
-            fx += Math.cos(a) * need;
-            fy += Math.sin(a) * need;
-            return;
-          }
-          if (d < need) {
-            const m = (need - d) / d;
-            fx += dx * m;
-            fy += dy * m;
-          }
-        };
-        for (let j = 0; j < occ.length; j++) acc(occ[j].x, occ[j].y, occ[j].sep);
-        for (let j = 0; j < bodies.length; j++) {
-          if (i !== j) acc(bodies[j].x, bodies[j].y, bodies[j].sep);
-        }
-        bodies[i].x += fx * 0.4;
-        bodies[i].y += fy * 0.4;
-      }
-    }
+    const ox = origin && origin.x != null ? origin.x : 0;
+    const oy = origin && origin.y != null ? origin.y : 0;
     const pos = {};
-    bodies.forEach((b) => {
-      pos[b.name] = { x: b.x, y: b.y, z: b.z };
+    (missing || []).forEach((s) => {
+      const p = emptyGridCell(ox, oy, blockers);
+      pos[s.name] = { x: p.x, y: p.y, z: s.kind === "dir" ? 12 : 0 };
+      blockers.push({ x: p.x, y: p.y });
+    });
+    return pos;
+  }
+
+  function placeUnoccupied(missing, saved, origin) {
+    const blockers = [];
+    Object.keys(saved || {}).forEach((k) => {
+      const p = saved[k];
+      if (!p) return;
+      blockers.push({ x: p.x, y: p.y, kind: p.kind || "file" });
+    });
+    const ox = origin && origin.x != null ? origin.x : 0;
+    const oy = origin && origin.y != null ? origin.y : 0;
+    const pos = {};
+    (missing || []).forEach((s) => {
+      const p = spiralAway(ox, oy, blockers, s.kind);
+      pos[s.name] = { x: p.x, y: p.y, z: p.z || 0 };
+      blockers.push({ x: p.x, y: p.y, kind: s.kind || "file" });
     });
     return pos;
   }
@@ -133,27 +168,228 @@
     return list;
   }
 
+  function clusterStats(blockers) {
+    if (!blockers || !blockers.length) return null;
+    let sx = 0;
+    let sy = 0;
+    let minx = Infinity;
+    let maxx = -Infinity;
+    let miny = Infinity;
+    let maxy = -Infinity;
+    blockers.forEach((o) => {
+      sx += o.x;
+      sy += o.y;
+      if (o.x < minx) minx = o.x;
+      if (o.x > maxx) maxx = o.x;
+      if (o.y < miny) miny = o.y;
+      if (o.y > maxy) maxy = o.y;
+    });
+    const n = blockers.length;
+    const cx = sx / n;
+    const cy = sy / n;
+    let r = 0;
+    blockers.forEach((o) => {
+      const d = Math.hypot(o.x - cx, o.y - cy);
+      if (d > r) r = d;
+    });
+    return { cx, cy, r, minx, maxx, miny, maxy };
+  }
+
+  function convexHull(pts) {
+    if (!pts || pts.length < 3) return null;
+    const raw = pts
+      .map((o) => ({ x: o.x, y: o.y }))
+      .sort((a, b) => a.x - b.x || a.y - b.y);
+    const uniq = [];
+    raw.forEach((q) => {
+      const last = uniq[uniq.length - 1];
+      if (!last || last.x !== q.x || last.y !== q.y) uniq.push(q);
+    });
+    if (uniq.length < 3) return null;
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const lower = [];
+    uniq.forEach((q) => {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0)
+        lower.pop();
+      lower.push(q);
+    });
+    const upper = [];
+    for (let i = uniq.length - 1; i >= 0; i--) {
+      const q = uniq[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0)
+        upper.pop();
+      upper.push(q);
+    }
+    lower.pop();
+    upper.pop();
+    return lower.concat(upper);
+  }
+
+  function pointInHull(hull, x, y) {
+    if (!hull || hull.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = hull.length - 1; i < hull.length; j = i++) {
+      const xi = hull[i].x;
+      const yi = hull[i].y;
+      const xj = hull[j].x;
+      const yj = hull[j].y;
+      const denom = yj - yi || 1e-12;
+      const hit = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / denom + xi;
+      if (hit) inside = !inside;
+    }
+    return inside;
+  }
+
+  function distPointSeg(px, py, ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-8) return Math.hypot(px - ax, py - ay);
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+  }
+
+  function knnPairs(blockers, k) {
+    const n = blockers.length;
+    const seen = {};
+    const pairs = [];
+    for (let i = 0; i < n; i++) {
+      const ds = [];
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        ds.push({ j, d: Math.hypot(blockers[i].x - blockers[j].x, blockers[i].y - blockers[j].y) });
+      }
+      ds.sort((a, b) => a.d - b.d);
+      const take = Math.min(k, ds.length);
+      for (let t = 0; t < take; t++) {
+        const j = ds[t].j;
+        const a = i < j ? i : j;
+        const b = i < j ? j : i;
+        const key = a + ":" + b;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        pairs.push([a, b, ds[t].d]);
+      }
+    }
+    return pairs;
+  }
+
+  function pickRand(list) {
+    if (!list || !list.length) return null;
+    return list[(Math.random() * list.length) | 0];
+  }
+
+  function samePt(a, b) {
+    return Math.abs(a.x - b.x) < 0.01 && Math.abs(a.y - b.y) < 0.01;
+  }
+
+  function isHullEdge(hull, a, b) {
+    if (!hull || hull.length < 2) return false;
+    for (let i = 0, j = hull.length - 1; i < hull.length; j = i++) {
+      const p = hull[j];
+      const q = hull[i];
+      if ((samePt(p, a) && samePt(q, b)) || (samePt(p, b) && samePt(q, a))) return true;
+    }
+    return false;
+  }
+
   function spiralAway(x, y, blockers, kind) {
     const selfSep = starSep(kind || "dir");
     const z0 = kind === "dir" ? 10 : 0;
+    const needOf = (o) => selfSep + starSep(o.kind);
     const blocked = (px, py) => {
       for (let i = 0; i < blockers.length; i++) {
-        const o = blockers[i];
-        const need = selfSep + starSep(o.kind);
-        if (Math.hypot(px - o.x, py - o.y) < need) return true;
+        if (Math.hypot(px - blockers[i].x, py - blockers[i].y) < needOf(blockers[i])) return true;
       }
       return false;
     };
-    if (!blocked(x, y)) return { x, y, z: z0 };
-    for (let i = 1; i < 96; i++) {
-      const a = i * GOLDEN;
-      const r = selfSep * 2 + 12 * Math.sqrt(i);
-      const px = x + Math.cos(a) * r;
-      const py = y + Math.sin(a) * r;
-      const pz = z0 + 6 * Math.sin(i * GOLDEN);
-      if (!blocked(px, py)) return { x: px, y: py, z: pz };
+    if (!blockers || !blockers.length) return { x, y, z: z0 };
+    const box = clusterStats(blockers);
+    const hull = convexHull(blockers);
+    const inGap = (px, py) => {
+      if (blocked(px, py)) return false;
+      if (hull && !pointInHull(hull, px, py)) return false;
+      return true;
+    };
+    const pad = selfSep * 1.15;
+    const corridors = [];
+    const pairs = knnPairs(blockers, 6);
+    for (let p = 0; p < pairs.length; p++) {
+      const a = blockers[pairs[p][0]];
+      const b = blockers[pairs[p][1]];
+      const d = pairs[p][2];
+      if (d < selfSep * 2) continue;
+      if (isHullEdge(hull, a, b)) continue;
+      let clear = true;
+      for (let i = 0; i < blockers.length; i++) {
+        if (blockers[i] === a || blockers[i] === b) continue;
+        if (distPointSeg(blockers[i].x, blockers[i].y, a.x, a.y, b.x, b.y) < pad) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      const ux = (b.x - a.x) / d;
+      const uy = (b.y - a.y) / d;
+      const rx = -uy;
+      const ry = ux;
+      const spots = [];
+      const steps = Math.max(4, Math.min(9, Math.round(d / (selfSep * 1.4))));
+      for (let s = 1; s < steps; s++) {
+        const t = s / steps;
+        if (t < 0.22 || t > 0.78) continue;
+        const px = a.x + ux * d * t;
+        const py = a.y + uy * d * t;
+        if (inGap(px, py)) spots.push({ x: px, y: py, z: z0 });
+      }
+      const midX = (a.x + b.x) / 2;
+      const midY = (a.y + b.y) / 2;
+      const off = selfSep * 0.8;
+      const p1 = { x: midX + rx * off, y: midY + ry * off, z: z0 };
+      const p2 = { x: midX - rx * off, y: midY - ry * off, z: z0 };
+      if (inGap(p1.x, p1.y)) spots.push(p1);
+      if (inGap(p2.x, p2.y)) spots.push(p2);
+      if (spots.length) corridors.push({ d, spots });
     }
-    return { x: x + selfSep * 2, y, z: z0 + 4 };
+    if (corridors.length) {
+      let maxD = 0;
+      for (let i = 0; i < corridors.length; i++) {
+        if (corridors[i].d > maxD) maxD = corridors[i].d;
+      }
+      const large = corridors.filter((c) => c.d >= maxD * 0.72);
+      const chosen = pickRand(large);
+      const spot = pickRand(chosen.spots);
+      if (spot) return spot;
+    }
+
+    const N = 16;
+    const rim = [];
+    for (let i = 0; i < N; i++) {
+      const a = (i * Math.PI * 2) / N;
+      const ux = Math.cos(a);
+      const uy = Math.sin(a);
+      let support = selfSep;
+      for (let b = 0; b < blockers.length; b++) {
+        const o = blockers[b];
+        const s = (o.x - box.cx) * ux + (o.y - box.cy) * uy + needOf(o);
+        if (s > support) support = s;
+      }
+      for (let t = 0; t < 12; t++) {
+        const rr = support + t * (selfSep * 0.18);
+        const px = box.cx + ux * rr;
+        const py = box.cy + uy * rr;
+        if (!blocked(px, py)) {
+          rim.push({ x: px, y: py, z: z0 });
+          break;
+        }
+      }
+    }
+    const edge = pickRand(rim);
+    if (edge) return edge;
+    if (!blocked(x, y)) return { x, y, z: z0 };
+    return { x: box.cx + box.r + selfSep * 2, y: box.cy, z: z0 };
   }
 
   function cloneMap(m) {
@@ -165,15 +401,32 @@
     return o;
   }
 
+  function livePosMap(map, names) {
+    const out = {};
+    Object.keys(map || {}).forEach((k) => {
+      if (names.has(k) && map[k]) out[k] = map[k];
+    });
+    return out;
+  }
+
   function dummy(container) {
     const msg = document.createElement("div");
     msg.className = "c3d-missing";
     msg.textContent =
       "Three.js failed to load from the CDN. Toggle back to 2D, or check the network and retry.";
     container.appendChild(msg);
+    const pending = {};
+    let layoutMode = "galaxy";
     return {
       missing: true,
-      setScene() {},
+      setScene(opts) {
+        if (!opts || opts.loading) return;
+        layoutMode = opts.layoutMode === "grid" ? "grid" : "galaxy";
+        const names = new Set((opts.children || []).map((c) => c && c.name));
+        Object.keys(pending).forEach((name) => {
+          if (names.has(name)) delete pending[name];
+        });
+      },
       arrangeBy() {},
       galaxy() {},
       flyEnter(_s, then) {
@@ -211,7 +464,14 @@
       screenOf() {
         return { x: 0, y: 0, r: 12 };
       },
-      notePending() {},
+      notePending(name, x, y, kind) {
+        const blockers = hintBlockers([], pending, name);
+        const p =
+          layoutMode === "grid"
+            ? emptyGridCell(x, y, blockers)
+            : spiralAway(x, y, blockers, kind);
+        pending[name] = { x: p.x, y: p.y, z: p.z || (kind === "dir" ? 10 : 0), kind: kind || "file" };
+      },
       placeHint() {
         return { x: 0, y: 0 };
       },
@@ -238,6 +498,13 @@
       .replace(/\//g, "\\")
       .replace(/\\+$/, "")
       .toLowerCase();
+  }
+  function glyphOf(star, looks) {
+    const map = looks || {};
+    const look = (star && (map[lookKey(star.path)] || map[star.path])) || null;
+    if (look && look.image) return look;
+    if (star && star.logo) return { image: star.logo };
+    return look;
   }
 
   function isCnsWord(star) {
@@ -365,6 +632,7 @@
         dirPath: "",
         frozen: {},
         arranged: false,
+        layoutMode: "galaxy",
         sel: new Set(),
         searchSel: new Set(),
         anchor: null,
@@ -425,6 +693,19 @@
           y: (-v.y * 0.5 + 0.5) * self.h,
           vis: v.z > -1 && v.z < 1,
         };
+      }
+
+      function pointerWorld(cx, cy) {
+        const r = renderer.domElement.getBoundingClientRect();
+        const nx = ((cx - r.left) / Math.max(1, r.width)) * 2 - 1;
+        const ny = -((cy - r.top) / Math.max(1, r.height)) * 2 + 1;
+        camera.updateMatrixWorld();
+        const rc = new THREE.Raycaster();
+        rc.setFromCamera(new THREE.Vector2(nx, ny), camera);
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        const hit = new THREE.Vector3();
+        if (!rc.ray.intersectPlane(plane, hit)) return { x: orbit.tx, y: orbit.tz };
+        return { x: hit.x, y: hit.z };
       }
 
       function setStatus() {
@@ -493,6 +774,7 @@
           const lab = document.createElement("div");
           lab.className = isCnsWord(st) ? "c3d-lab cns-word" : "c3d-lab";
           lab.textContent = st.name;
+          lab.title = st.name;
           labels.appendChild(lab);
           sprites.push({ obj, lab, star: st, base: obj.userData.baseScale });
         });
@@ -515,13 +797,28 @@
         setStatus();
         if (self.loading) return;
         self.hostLayout = !!opts.hostLayout;
+        self.layoutMode = opts.layoutMode === "grid" ? "grid" : "galaxy";
         self.dirPath = opts.dirPath || "";
         const Look = window.SDLook;
+        if (opts.resetCamera) {
+          orbit.theta = 0.55;
+          orbit.phi = 1.15;
+          orbit.r = 420;
+          orbit.tx = 0;
+          orbit.ty = 0;
+          orbit.tz = 0;
+        } else if (opts.camera) Object.assign(orbit, opts.camera);
+        fit();
         const children = (opts.children || []).map((c) => Object.assign({}, c));
         const saved = cloneMap(opts.savedPositions || {});
         const missing = children.filter((c) => !saved[c.name]);
         let map = saved;
         let changed = false;
+        const origin = { x: orbit.tx, y: orbit.tz };
+        const dist = Math.max(80, orbit.r || 420);
+        const vFov = ((camera && camera.fov ? camera.fov : 50) * Math.PI) / 180;
+        const worldH = 2 * dist * Math.tan(vFov / 2);
+        const worldW = worldH * (Math.max(1, self.w || 480) / Math.max(1, self.h || 320));
         if (opts.hostLayout) {
           map = {};
           children.forEach((c) => {
@@ -529,7 +826,10 @@
           });
           changed = false;
         } else if (!Object.keys(saved).length && children.length) {
-          map = layoutGalaxy(children);
+          map =
+            self.layoutMode === "grid"
+              ? packGrid(children, origin, worldW, worldH)
+              : layoutGalaxy(children);
           changed = true;
         } else if (missing.length) {
           const occ = cloneMap(saved);
@@ -543,14 +843,20 @@
             if (p) occ[c.name] = { x: p.x, y: p.y, z: p.z || 0, kind: c.kind };
             else rest.push(c);
           });
-          map = Object.assign({}, saved, rest.length ? placeUnoccupied(rest, occ) : {});
+          const placed =
+            rest.length === 0
+              ? {}
+              : self.layoutMode === "grid"
+                ? placeUnoccupiedGrid(rest, occ, origin)
+                : placeUnoccupied(rest, occ, origin);
+          map = Object.assign({}, saved, placed);
           changed = true;
         }
+        const pend = self.pending || {};
+        const names = new Set(children.map((c) => c.name));
         if (!opts.hostLayout) {
-          const pend = self.pending || {};
-          const names = new Set(children.map((c) => c.name));
           Object.keys(pend).forEach((name) => {
-            if (!names.has(name)) return;
+            if (!names.has(name) || saved[name]) return;
             map[name] = Object.assign({}, map[name] || {}, {
               x: pend[name].x,
               y: pend[name].y,
@@ -559,7 +865,18 @@
             changed = true;
           });
         }
-        self.pending = {};
+        if (!opts.hostLayout && !opts.error) {
+          const live = livePosMap(map, names);
+          if (Object.keys(map).some((k) => !names.has(k))) {
+            map = live;
+            changed = true;
+          }
+        }
+        const kept = {};
+        Object.keys(pend).forEach((name) => {
+          if (!names.has(name)) kept[name] = pend[name];
+        });
+        self.pending = kept;
         self.frozen = cloneMap(map);
         self.arranged = false;
         self.stars = children.map((c) =>
@@ -573,7 +890,7 @@
         );
         if (opts.looks) self.looks = opts.looks;
         self.stars.forEach((s) => {
-          s.glyph = (self.looks && (self.looks[lookKey(s.path)] || self.looks[s.path])) || null;
+          s.glyph = glyphOf(s, self.looks);
           if (s.glyph && s.glyph.dirStyle) s.dirStyle = s.glyph.dirStyle;
         });
         const keep = new Set(self.stars.map((s) => s.name));
@@ -583,14 +900,6 @@
         rebuild();
         rebuildFar();
         if (changed && !opts.ephemeral) emitPos();
-        if (opts.resetCamera) {
-          orbit.theta = 0.55;
-          orbit.phi = 1.15;
-          orbit.r = 420;
-          orbit.tx = 0;
-          orbit.ty = 0;
-          orbit.tz = 0;
-        } else if (opts.camera) Object.assign(orbit, opts.camera);
       }
 
       function arrangeBy(key) {
@@ -756,6 +1065,14 @@
       function isNav(e) {
         return e.ctrlKey || e.metaKey;
       }
+      function grabGroup(star) {
+        if (!star) return [];
+        const names = self.sel.has(star.name) ? [...self.sel] : [star.name];
+        return names
+          .map((n) => self.stars.find((x) => x.name === n))
+          .filter(Boolean)
+          .map((st) => ({ star: st, x: st.x, y: st.y, z: st.z || 0 }));
+      }
       function zoomCamera(e) {
         const zoomIn = e.deltaY < 0;
         orbit.r = Math.max(orbitMin(), Math.min(ORBIT_MAX, orbit.r * (zoomIn ? 0.9 : 1.1)));
@@ -905,33 +1222,49 @@
         applyCam();
       }
 
-      function moveGrabbedStar(star, dx, dy, e) {
+      function moveGrabbedStar(star, grab, dx, dy, e) {
+        const d = self.drag;
+        if (!d || !star || !grab) return;
         applyCam();
         camera.updateMatrixWorld();
-        const pos = new THREE.Vector3(star.x, star.z || 0, star.y);
-        const dist = Math.max(1, camera.position.distanceTo(pos));
         const vFov = (camera.fov * Math.PI) / 180;
-        const worldPerPxY = (2 * dist * Math.tan(vFov / 2)) / Math.max(1, self.h);
-        const worldPerPxX = worldPerPxY * camera.aspect;
-        const right = new THREE.Vector3();
-        const up = new THREE.Vector3();
-        const back = new THREE.Vector3();
-        camera.matrixWorld.extractBasis(right, up, back);
+        const depth = Math.max(1, d.grabDepth || 1);
+        const viewH = Math.max(1, d.grabViewH || self.h);
+        // Vertical FOV: 1 CSS pixel is the same world size on X and Y.
+        // Do not multiply X by aspect — that makes the star run ahead of the mouse.
+        const worldPerPx = (2 * depth * Math.tan(vFov / 2)) / viewH;
+        const right = d.grabRight || new THREE.Vector3(1, 0, 0);
+        const up = d.grabUp || new THREE.Vector3(0, 1, 0);
+        let x = grab.x;
+        let y = grab.y;
+        let z = grab.z;
         if (e && e.shiftKey) {
-          star.z = (star.z || 0) + -dy * worldPerPxY;
+          z = grab.z + -dy * worldPerPx;
         } else {
-          const d = new THREE.Vector3()
-            .addScaledVector(right, dx * worldPerPxX)
-            .addScaledVector(up, -dy * worldPerPxY);
-          star.x += d.x;
-          star.z = (star.z || 0) + d.y;
-          star.y += d.z;
+          x = grab.x + right.x * dx * worldPerPx + up.x * (-dy) * worldPerPx;
+          z = grab.z + right.y * dx * worldPerPx + up.y * (-dy) * worldPerPx;
+          y = grab.y + right.z * dx * worldPerPx + up.z * (-dy) * worldPerPx;
         }
-        const sp = sprites.find((x) => x.star === star);
-        if (sp) sp.obj.position.set(star.x, star.z || 0, star.y);
-        if (!self.arranged) {
-          self.frozen[star.name] = { x: star.x, y: star.y, z: star.z || 0 };
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+        star.x = x;
+        star.y = y;
+        star.z = z;
+        const sp = sprites.find((sp) => sp.star === star);
+        if (sp) {
+          sp.obj.visible = true;
+          sp.obj.position.set(star.x, star.z || 0, star.y);
         }
+        self.frozen[star.name] = { x: star.x, y: star.y, z: star.z || 0 };
+      }
+
+      function moveGroupFromGrab(dx, dy, e) {
+        const d = self.drag;
+        if (!d) return;
+        const members =
+          d.group && d.group.length
+            ? d.group
+            : [{ star: d.star, x: d.grabX, y: d.grabY, z: d.grabZ }];
+        members.forEach((g) => moveGrabbedStar(g.star, g, dx, dy, e));
       }
 
       container.addEventListener("pointerdown", (e) => {
@@ -939,9 +1272,6 @@
         if (e.button !== 0 && e.button !== 1) return;
         e.preventDefault();
         if (h.onActivate) h.onActivate();
-        try {
-          container.setPointerCapture(e.pointerId);
-        } catch (_) {}
         const s = e.button === 0 ? hit(e.clientX, e.clientY) : null;
         const second =
           e.button === 0 &&
@@ -954,12 +1284,34 @@
         else if (e.button === 0 && second && !isNav(e) && !s) kind = "dblpan";
         else if (e.button === 0 && isNav(e)) kind = "nav";
         else if (e.button === 0 && s) kind = "star";
+        if (kind !== "star") {
+          try {
+            container.setPointerCapture(e.pointerId);
+          } catch (_) {}
+        }
         if (kind === "pan" || kind === "orbit" || kind === "dblpan") {
           self.leaveAcc = 0;
           self.enterAcc = 0;
           self.enterTarget = null;
         }
         const r = container.getBoundingClientRect();
+        applyCam();
+        camera.updateMatrixWorld();
+        let grabDepth = 1;
+        let grabRight = null;
+        let grabUp = null;
+        let grabViewH = Math.max(1, self.h);
+        if (s) {
+          const pos = new THREE.Vector3(s.x, s.z || 0, s.y);
+          const view = pos.clone().applyMatrix4(camera.matrixWorldInverse);
+          grabDepth = Math.max(1, -view.z);
+          grabRight = new THREE.Vector3();
+          grabUp = new THREE.Vector3();
+          const back = new THREE.Vector3();
+          camera.matrixWorld.extractBasis(grabRight, grabUp, back);
+          const canvas = renderer.domElement.getBoundingClientRect();
+          grabViewH = Math.max(1, canvas.height);
+        }
         self.drag = {
           kind,
           star: s,
@@ -970,6 +1322,11 @@
           grabX: s ? s.x : 0,
           grabY: s ? s.y : 0,
           grabZ: s ? s.z || 0 : 0,
+          grabDepth,
+          grabRight,
+          grabUp,
+          grabViewH,
+          group: s ? grabGroup(s) : [],
           lastClient: { x: e.clientX, y: e.clientY },
           ghost: null,
           moved: false,
@@ -985,9 +1342,12 @@
         self.mouse.y = e.clientY - r.top;
         self.hover = hit(e.clientX, e.clientY);
         if (h.onHover) h.onHover(self.hover);
-        const wpos = self.hover ? { x: self.hover.x, y: self.hover.y } : { x: orbit.tx, y: orbit.tz };
+        const wpos = pointerWorld(e.clientX, e.clientY);
         if (h.onWorldPointer) h.onWorldPointer(wpos, { x: e.clientX, y: e.clientY });
         if (!self.drag) return;
+        if (self.drag.kind === "star" && e.clientX === 0 && e.clientY === 0) {
+          return;
+        }
         const dx = e.clientX - self.drag.lx;
         const dy = e.clientY - self.drag.ly;
         if (Math.hypot(dx, dy) > 3) {
@@ -1037,22 +1397,54 @@
         if (window.SDStarDrag) window.SDStarDrag.hide();
       }
 
+      function snapMovedToGrid(d) {
+        const moved = (d.group && d.group.length ? d.group : [{ star: d.star }])
+          .map((g) => g && g.star)
+          .filter(Boolean);
+        if (!moved.length) return;
+        const taken = {};
+        self.stars.forEach((s) => {
+          if (moved.indexOf(s) >= 0) return;
+          const g = gridCell(s.x, s.y);
+          taken[occupyKey(g.c, g.r)] = 1;
+        });
+        function blockersOf() {
+          return Object.keys(taken).map((k) => {
+            const parts = k.split(":");
+            return gridXy(+parts[0], +parts[1]);
+          });
+        }
+        const leader = d.star || moved[0];
+        const from = gridCell(leader.x, leader.y);
+        const lp = emptyGridCell(leader.x, leader.y, blockersOf());
+        const to = gridCell(lp.x, lp.y);
+        const dc = to.c - from.c;
+        const dr = to.r - from.r;
+        moved.forEach((st) => {
+          const g = gridCell(st.x, st.y);
+          const p = emptyGridCell((g.c + dc) * GRID_W, (g.r + dr) * GRID_H, blockersOf());
+          st.x = p.x;
+          st.y = p.y;
+          taken[occupyKey(gridCell(p.x, p.y).c, gridCell(p.x, p.y).r)] = 1;
+          self.frozen[st.name] = { x: st.x, y: st.y, z: st.z || 0 };
+          const sp = sprites.find((x) => x.star === st);
+          if (sp) sp.obj.position.set(st.x, st.z || 0, st.y);
+        });
+      }
+
       function moveStarFromGrab(e) {
         const d = self.drag;
         if (!d || d.kind !== "star" || !d.star) return;
+        if (e.clientX === 0 && e.clientY === 0) return;
         d.lastClient = { x: e.clientX, y: e.clientY };
-        if (Math.hypot(e.clientX - d.px, e.clientY - d.py) > 3) d.moved = true;
+        if (Math.hypot(e.clientX - d.px, e.clientY - d.py) > 8) d.moved = true;
+        if (!d.moved) return;
+        const sp = sprites.find((x) => x.star === d.star);
+        if (sp) sp.obj.visible = true;
         if (pointerInContainer(e.clientX, e.clientY)) {
-          const st = d.star;
-          st.x = d.grabX;
-          st.y = d.grabY;
-          st.z = d.grabZ;
-          const sp = sprites.find((x) => x.star === st);
-          if (sp) sp.obj.position.set(st.x, st.z || 0, st.y);
-          moveGrabbedStar(st, e.clientX - d.px, e.clientY - d.py, e);
-        }
-        if (d.moved && window.SDStarDrag) {
-          setStarSpriteVisible(d.star, false);
+          moveGroupFromGrab(e.clientX - d.px, e.clientY - d.py, e);
+          hideStarGhost();
+        } else if (window.SDStarDrag) {
           if (!d.ghost) d.ghost = window.SDStarDrag.capture(d.star, d.star.kind === "dir" ? 16 : 12);
           window.SDStarDrag.show(d.ghost, e.clientX, e.clientY);
         }
@@ -1065,6 +1457,9 @@
         self.drag = null;
         hideMarquee();
         hideStarGhost();
+        (d.group || []).forEach((g) => {
+          if (g && g.star) setStarSpriteVisible(g.star, true);
+        });
         if (d.star) setStarSpriteVisible(d.star, true);
         try {
           container.releasePointerCapture(ev.pointerId);
@@ -1083,7 +1478,10 @@
         }
         if (d.kind === "star" && d.moved) {
           const fileMove = h.onStarDragEnd ? h.onStarDragEnd(d.star, ev) : false;
-          if (!self.arranged && !fileMove) emitPos();
+          if (!fileMove) {
+            if (self.layoutMode === "grid") snapMovedToGrid(d);
+            emitPos();
+          }
           return;
         }
         if (d.kind === "pan" || d.kind === "orbit") return;
@@ -1156,6 +1554,7 @@
 
       function onWinStarPointer(e) {
         if (!self.live || self.dead) return;
+        if (e.clientX === 0 && e.clientY === 0) return;
         if (self.drag && self.drag.kind === "star") moveStarFromGrab(e);
       }
 
@@ -1236,6 +1635,7 @@
             self.searchSel.has(sp.star.name) ||
             self.hover === sp.star;
           sp.lab.classList.toggle("sel", self.sel.has(sp.star.name) || self.searchSel.has(sp.star.name));
+          sp.lab.classList.toggle("hover", self.hover === sp.star);
           if (isCnsWord(sp.star) && !cnsLabelsOpen && !on) {
             sp.lab.style.opacity = "0";
             return;
@@ -1255,7 +1655,7 @@
       }
 
       function loop() {
-        if (self.dead) return;
+        if (self.dead || !self.live) return;
         applyCam();
         const now = performance.now();
         const Look = window.SDLook;
@@ -1365,8 +1765,9 @@
           return self.stars;
         },
         starAtClient: hit,
-        worldFromClient() {
-          return { x: orbit.tx, y: orbit.tz };
+        worldFromClient(cx, cy) {
+          if (cx == null || cy == null) return { x: orbit.tx, y: orbit.tz };
+          return pointerWorld(cx, cy);
         },
         screenOf(star) {
           const sp = sprites.find((x) => x.star.name === star.name);
@@ -1377,8 +1778,12 @@
         },
         notePending(name, x, y, kind) {
           if (!self.pending) self.pending = {};
-          const p = spiralAway(x, y, hintBlockers(self.stars, self.pending, name), kind);
-          self.pending[name] = { x: p.x, y: p.y, z: p.z || 0, kind: kind || "file" };
+          const blockers = hintBlockers(self.stars, self.pending, name);
+          const p =
+            self.layoutMode === "grid"
+              ? emptyGridCell(x, y, blockers)
+              : spiralAway(x, y, blockers, kind);
+          self.pending[name] = { x: p.x, y: p.y, z: p.z || (kind === "dir" ? 10 : 0), kind: kind || "file" };
         },
         placeHint() {
           return { x: orbit.tx, y: orbit.tz };
@@ -1387,7 +1792,7 @@
         setLooks(map) {
           self.looks = map || {};
           self.stars.forEach((s) => {
-            s.glyph = (self.looks && (self.looks[lookKey(s.path)] || self.looks[s.path])) || null;
+            s.glyph = glyphOf(s, self.looks);
             if (s.glyph && s.glyph.dirStyle) s.dirStyle = s.glyph.dirStyle;
           });
           rebuild();
